@@ -23,10 +23,11 @@ if not GEMINI_API_KEY:
     raise RuntimeError("Не найден GEMINI_API_KEY в .env")
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-with open("PERSONALITY.md", "r", encoding="utf-8") as file:
+with open("brain/PERSONALITY.md", "r", encoding="utf-8") as file:
     SYSTEM_PROMPT = file.read()
 
-
+with open("brain/USER.md", "r", encoding="utf-8") as file:
+    USER_INFO = file.read()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -39,7 +40,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     response = gemini_client.models.generate_content(
         model="gemini-3-flash-preview",
-        contents=f"{SYSTEM_PROMPT}\n\nСообщение Марго: {user_text}"
+        contents=f"{SYSTEM_PROMPT}\n\n{USER_INFO}\n\nСообщение Марго:\n{user_text}"
     )
 
     await update.message.reply_text(response.text)
