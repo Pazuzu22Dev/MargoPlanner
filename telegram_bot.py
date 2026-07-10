@@ -23,17 +23,9 @@ if not GEMINI_API_KEY:
     raise RuntimeError("Не найден GEMINI_API_KEY в .env")
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+with open("PERSONALITY.md", "r", encoding="utf-8") as file:
+    SYSTEM_PROMPT = file.read()
 
-SYSTEM_PROMPT = """
-Ты MargoPlanner — личный Telegram-помощник Марго.
-
-Правила:
-1. Отвечай по-русски.
-2. Обращайся к Марго уважительно и немного игриво: "моя госпожа".
-3. Не будь слишком длинным.
-4. Если пользователь просит создать план, событие или задачу — сначала уточни, как ты понял, и спроси подтверждение.
-5. Пока не создавай события в календаре, только отвечай текстом.
-"""
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
