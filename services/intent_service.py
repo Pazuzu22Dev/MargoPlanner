@@ -190,10 +190,10 @@ def detect_intent(user_text: str, conversation=None, memories="") -> dict:
       "value": "полный актуальный факт; для delete пустая строка"
     }}
   ],
-  "reminder": {
+  "reminder": {{
     "text": "что именно напомнить или пустая строка",
     "remind_at": "ISO 8601 с часовым поясом или пустая строка"
-  },
+  }},
   "events": [
     {{
       "title": "название события",
