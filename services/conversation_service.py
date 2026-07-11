@@ -65,6 +65,7 @@ def apply_intent(conversation, intent):
         "update_event",
         "delete_event",
         "delete_events",
+        "create_reminder",
     }:
         updated["draft"] = {
             "operation": action,
