@@ -126,6 +126,31 @@ class IntentValidationTests(unittest.TestCase):
         self.assertEqual(event["contacts"], ["dasha@example.com"])
         self.assertEqual(event["attendees"], [])
 
+    def test_valid_telegram_reminder(self):
+        result = validate_intent(
+            {
+                "action": "create_reminder",
+                "reminder": {
+                    "text": "Ответить в LinkedIn",
+                    "remind_at": "2026-07-12T10:00:00+02:00",
+                },
+            }
+        )
+        self.assertEqual(result["events"], [])
+        self.assertEqual(result["reminder"]["text"], "Ответить в LinkedIn")
+
+    def test_reminder_without_timezone_is_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_intent(
+                {
+                    "action": "create_reminder",
+                    "reminder": {
+                        "text": "Ответить в LinkedIn",
+                        "remind_at": "2026-07-12T10:00:00",
+                    },
+                }
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
