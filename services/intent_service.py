@@ -35,6 +35,8 @@ ALLOWED_ACTIONS = {
     "delete_events",
     "create_reminder",
     "list_reminders",
+    "delete_reminder",
+    "delete_reminders",
 }
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -77,6 +79,7 @@ def validate_intent(raw_intent):
             raw_intent.get("memory_updates", [])
         ),
         "reminder": raw_intent.get("reminder") or {},
+        "target_reminder_ids": raw_intent.get("target_reminder_ids") or [],
     }
 
     if not isinstance(result["events"], list):
@@ -85,6 +88,12 @@ def validate_intent(raw_intent):
         raise ValueError("search должен быть объектом")
     if not isinstance(result["reminder"], dict):
         raise ValueError("reminder должен быть объектом")
+    if not isinstance(result["target_reminder_ids"], list):
+        raise ValueError("target_reminder_ids должен быть списком")
+    result["target_reminder_ids"] = [
+        int(item) for item in result["target_reminder_ids"]
+        if str(item).isdigit() and int(item) > 0
+    ]
     if action == "clarify" and not result["clarification_question"]:
         raise ValueError("Для уточнения нужен вопрос")
     if action == "chat":
@@ -107,7 +116,7 @@ def validate_intent(raw_intent):
         result["events"] = []
     if action == "update_event" and len(result["events"]) != 1:
         raise ValueError("Для изменения нужен ровно один новый вариант события")
-    if action in {"update_event", "delete_event", "delete_events", "list_reminders"}:
+    if action in {"update_event", "delete_event", "delete_events", "list_reminders", "delete_reminder", "delete_reminders"}:
         result["search"] = {
             "text": str(result["search"].get("text", "")).strip(),
             "time_min": str(result["search"].get("time_min", "")).strip(),
@@ -118,6 +127,9 @@ def validate_intent(raw_intent):
                 raise ValueError("Для списка напоминаний нужен диапазон дат")
             _validate_iso_datetime(result["search"]["time_min"], "time_min")
             _validate_iso_datetime(result["search"]["time_max"], "time_max")
+        elif action in {"delete_reminder", "delete_reminders"}:
+            if not result["target_reminder_ids"] and not any(result["search"].values()):
+                raise ValueError("Для удаления напоминаний нужны ID или поиск")
         elif not result["target_event_id"] and not any(result["search"].values()):
             raise ValueError("Для изменения или удаления нужны данные поиска")
 
@@ -179,7 +191,7 @@ def detect_intent(user_text: str, conversation=None, memories="") -> dict:
 
 Верни строго JSON с полной актуальной версией плана:
 {{
-  "action": "chat | clarify | create_events | update_event | delete_event | delete_events | create_reminder | list_reminders",
+  "action": "chat | clarify | create_events | update_event | delete_event | delete_events | create_reminder | list_reminders | delete_reminder | delete_reminders",
   "clarification_question": "один естественный вопрос или пустая строка",
   "reason": "кратко, что понято",
   "target_event_id": "ID только из draft.candidates или пустая строка",
@@ -200,6 +212,7 @@ def detect_intent(user_text: str, conversation=None, memories="") -> dict:
     "text": "что именно напомнить или пустая строка",
     "remind_at": "ISO 8601 с часовым поясом или пустая строка"
   }},
+  "target_reminder_ids": ["ID напоминаний только из draft.reminder_candidates"],
   "events": [
     {{
       "title": "название события",
@@ -257,6 +270,13 @@ def detect_intent(user_text: str, conversation=None, memories="") -> dict:
     дня или периода с часовым поясом. Для «сегодня» это 00:00 сегодняшнего дня
     и 00:00 следующего; для «завтра» — аналогично для завтрашнего дня.
     search.text оставь пустым. Это запрос списка, подтверждение не требуется.
+18. Для удаления одного напоминания используй delete_reminder, нескольких или
+    всех — delete_reminders. Если Марго ссылается на номера из последнего
+    списка, перенеси настоящие id из draft.reminder_candidates в
+    target_reminder_ids. Не путай напоминания с событиями календаря и никогда
+    не выдумывай ID. Для удаления по дате или названию заполни search. Фраза
+    «удали все напоминания» означает все активные напоминания: поставь
+    time_min на текущее время, time_max на 2100-01-01T00:00 с часовым поясом.
 """
 
     for attempt in range(3):
