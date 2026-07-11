@@ -1,9 +1,11 @@
 import os
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ.setdefault("GEMINI_API_KEY", "test-key")
 
-from services.intent_service import validate_intent
+from services.intent_service import detect_intent, validate_intent
 
 
 class IntentValidationTests(unittest.TestCase):
@@ -150,6 +152,24 @@ class IntentValidationTests(unittest.TestCase):
                     },
                 }
             )
+
+    def test_reminder_prompt_is_valid_and_reaches_gemini(self):
+        response = SimpleNamespace(
+            text=(
+                '{"action":"create_reminder","reminder":'
+                '{"text":"Проверить напоминания",'
+                '"remind_at":"2026-07-11T23:15:00+02:00"}}'
+            )
+        )
+        with patch(
+            "services.intent_service.gemini_client.models.generate_content",
+            return_value=response,
+        ) as generate:
+            result = detect_intent(
+                "Напомни мне через две минуты проверить напоминания"
+            )
+        self.assertEqual(result["action"], "create_reminder")
+        self.assertEqual(generate.call_count, 1)
 
 
 if __name__ == "__main__":
