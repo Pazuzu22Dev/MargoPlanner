@@ -387,8 +387,8 @@ async def process_user_text(update, context, user_text):
 
         if state == ConversationState.WAITING_FOR_CONFIRMATION:
             draft = conversation["draft"]
-            events = draft["events"]
             operation = draft.get("operation", "create_events")
+            events = draft.get("events", [])
 
             if normalized_text in YES_ANSWERS:
                 if operation == "create_reminder":
