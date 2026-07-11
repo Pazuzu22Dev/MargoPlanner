@@ -58,6 +58,27 @@ class ReminderStore:
             for row in rows
         ]
 
+    def list_pending(self, user_id, time_min, time_max):
+        start = datetime.fromisoformat(time_min)
+        end = datetime.fromisoformat(time_max)
+        if start.tzinfo is None or end.tzinfo is None:
+            raise ValueError("Диапазон напоминаний должен содержать часовой пояс")
+        if end <= start:
+            raise ValueError("Конец диапазона должен быть позже начала")
+        start_utc = start.astimezone(timezone.utc).isoformat()
+        end_utc = end.astimezone(timezone.utc).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, user_id, text, remind_at FROM reminders "
+                "WHERE user_id = ? AND status = 'pending' "
+                "AND remind_at >= ? AND remind_at < ? ORDER BY remind_at",
+                (user_id, start_utc, end_utc),
+            ).fetchall()
+        return [
+            {"id": row[0], "user_id": row[1], "text": row[2], "remind_at": row[3]}
+            for row in rows
+        ]
+
     def mark_sent(self, reminder_id):
         with self._connect() as connection:
             connection.execute(
