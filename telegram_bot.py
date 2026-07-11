@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -41,6 +41,7 @@ from services.conversation_service import (
 from services.intent_service import detect_intent
 from services.memory_service import MemoryStore
 from services.voice_service import VoiceQuotaError, transcribe_voice
+from services.reminder_service import ReminderStore
 
 
 load_dotenv()
@@ -53,8 +54,10 @@ DATA_DIR = Path(
 PERSISTENCE_PATH = DATA_DIR / "telegram_state.pickle"
 MEMORY_PATH = DATA_DIR / "memory.sqlite"
 ACTION_HISTORY_PATH = DATA_DIR / "actions.sqlite"
+REMINDER_PATH = DATA_DIR / "reminders.sqlite"
 memory_store = MemoryStore(MEMORY_PATH)
 action_history_store = ActionHistoryStore(ACTION_HISTORY_PATH)
+reminder_store = ReminderStore(REMINDER_PATH)
 logger = logging.getLogger(__name__)
 
 if not BOT_TOKEN:
@@ -91,6 +94,38 @@ UNDO_REQUESTS = {
 }
 MAX_VOICE_DURATION_SECONDS = 10 * 60
 MAX_VOICE_SIZE_BYTES = 15 * 1024 * 1024
+
+
+def format_reminder(reminder):
+    remind_at = datetime.fromisoformat(reminder["remind_at"])
+    return (
+        f"🔔 {reminder['text']}\n"
+        f"🕒 {remind_at.strftime('%d.%m.%Y в %H:%M')}"
+    )
+
+
+async def reminder_dispatcher(application):
+    reminder_store.recover_interrupted()
+    while True:
+        for reminder in reminder_store.claim_due():
+            try:
+                await application.bot.send_message(
+                    chat_id=reminder["user_id"],
+                    text="🔔 Напоминаю: " + reminder["text"],
+                )
+            except Exception:
+                reminder_store.release(reminder["id"])
+                logger.exception("Не удалось отправить напоминание id=%s", reminder["id"])
+            else:
+                reminder_store.mark_sent(reminder["id"])
+        await asyncio.sleep(20)
+
+
+async def start_background_tasks(application):
+    application.create_task(
+        reminder_dispatcher(application),
+        name="reminder-dispatcher",
+    )
 
 
 def _conflict_signature(conflicts):
@@ -356,6 +391,20 @@ async def process_user_text(update, context, user_text):
             operation = draft.get("operation", "create_events")
 
             if normalized_text in YES_ANSWERS:
+                if operation == "create_reminder":
+                    reminder = draft["reminder"]
+                    await asyncio.to_thread(
+                        reminder_store.create,
+                        update.effective_user.id,
+                        reminder["text"],
+                        reminder["remind_at"],
+                    )
+                    clear_conversation(context)
+                    await update.message.reply_text(
+                        "Готово, напомню тебе в Telegram. 🔔\n\n"
+                        + format_reminder(reminder)
+                    )
+                    return
                 if operation == "create_events":
                     excluded_ids = batch_event_ids(draft["batch_id"], len(events))
                 elif operation == "delete_events":
@@ -560,6 +609,17 @@ async def process_user_text(update, context, user_text):
         )
         return
 
+    if action == "create_reminder":
+        reminder = intent["reminder"]
+        conversation = apply_intent(conversation, intent)
+        save_conversation(context, conversation)
+        await update.message.reply_text(
+            "Поставить напоминание в Telegram:\n\n"
+            + format_reminder(reminder)
+            + "\n\nПодтвердить? Ответьте «да» или «нет»."
+        )
+        return
+
     if action in {"update_event", "delete_event", "delete_events"}:
         previous_candidates = conversation.get("draft", {}).get("candidates", [])
         selected_id = intent.get("target_event_id", "")
@@ -684,6 +744,7 @@ def main():
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .persistence(persistence)
+        .post_init(start_background_tasks)
         .build()
     )
 
