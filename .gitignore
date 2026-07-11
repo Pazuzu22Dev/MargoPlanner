@@ -5,3 +5,7 @@ __pycache__/
 .DS_Store
 credentials.json
 token.json
+storage/*.pickle
+storage/*.pickle.*
+storage/*.sqlite
+storage/*.sqlite-*

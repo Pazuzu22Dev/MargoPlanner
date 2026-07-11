@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -9,91 +10,233 @@ from google import genai
 from google.genai import types
 from google.genai.errors import ServerError
 
+from services.memory_service import validate_memory_updates
+
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_BRAIN_MODEL = os.getenv(
+    "GEMINI_BRAIN_MODEL",
+    "gemini-3.1-flash-lite",
+)
 
 if not GEMINI_API_KEY:
     raise RuntimeError("Не найден GEMINI_API_KEY в .env")
 
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-
 TIMEZONE = ZoneInfo("Europe/Podgorica")
+ALLOWED_ACTIONS = {
+    "chat",
+    "clarify",
+    "create_events",
+    "update_event",
+    "delete_event",
+    "delete_events",
+}
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
-def detect_intent(user_text: str) -> dict:
+def _validate_iso_datetime(value, field_name):
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} должен содержать дату и время")
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        raise ValueError(f"{field_name} должен содержать часовой пояс")
+    return parsed
+
+
+def _string_list(event, field_name):
+    value = event.get(field_name) or []
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} должен быть списком")
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def validate_intent(raw_intent):
+    """Validate the model boundary before its output can reach an API."""
+    if not isinstance(raw_intent, dict):
+        raise ValueError("Gemini должен вернуть JSON-объект")
+
+    action = raw_intent.get("action")
+    if action not in ALLOWED_ACTIONS:
+        raise ValueError(f"Неизвестное действие: {action}")
+
+    result = {
+        "action": action,
+        "clarification_question": str(
+            raw_intent.get("clarification_question", "")
+        ).strip(),
+        "reason": str(raw_intent.get("reason", "")).strip(),
+        "events": raw_intent.get("events") or [],
+        "target_event_id": str(raw_intent.get("target_event_id", "")).strip(),
+        "search": raw_intent.get("search") or {},
+        "memory_updates": validate_memory_updates(
+            raw_intent.get("memory_updates", [])
+        ),
+    }
+
+    if not isinstance(result["events"], list):
+        raise ValueError("events должен быть списком")
+    if not isinstance(result["search"], dict):
+        raise ValueError("search должен быть объектом")
+    if action == "clarify" and not result["clarification_question"]:
+        raise ValueError("Для уточнения нужен вопрос")
+    if action == "chat":
+        result["events"] = []
+    if action in {"delete_event", "delete_events"}:
+        result["events"] = []
+    if action == "create_events" and not result["events"]:
+        raise ValueError("Для создания нужен хотя бы один event")
+    if action == "update_event" and len(result["events"]) != 1:
+        raise ValueError("Для изменения нужен ровно один новый вариант события")
+    if action in {"update_event", "delete_event", "delete_events"}:
+        result["search"] = {
+            "text": str(result["search"].get("text", "")).strip(),
+            "time_min": str(result["search"].get("time_min", "")).strip(),
+            "time_max": str(result["search"].get("time_max", "")).strip(),
+        }
+        if not result["target_event_id"] and not any(result["search"].values()):
+            raise ValueError("Для изменения или удаления нужны данные поиска")
+
+    normalized_events = []
+    for event in result["events"]:
+        if not isinstance(event, dict):
+            raise ValueError("Каждое событие должно быть объектом")
+        title = str(event.get("title", "")).strip()
+        if not title:
+            raise ValueError("У события должно быть название")
+        start = _validate_iso_datetime(event.get("start_time"), "start_time")
+        end = _validate_iso_datetime(event.get("end_time"), "end_time")
+        if end <= start:
+            raise ValueError("Конец события должен быть позже начала")
+        normalized_events.append(
+            {
+                "title": title,
+                "start_time": start.isoformat(),
+                "end_time": end.isoformat(),
+                "description": str(event.get("description", "")).strip(),
+                "location": str(event.get("location", "")).strip(),
+                "links": _string_list(event, "links"),
+                "contacts": _string_list(event, "contacts"),
+                "attendees": [
+                    email.lower()
+                    for email in _string_list(event, "attendees")
+                    if EMAIL_PATTERN.fullmatch(email)
+                ],
+            }
+        )
+
+    if action not in {"chat", "delete_event", "delete_events"}:
+        result["events"] = normalized_events
+    return result
+
+
+def detect_intent(user_text: str, conversation=None, memories="") -> dict:
     current_time = datetime.now(TIMEZONE).isoformat()
+    conversation_json = json.dumps(
+        conversation or {}, ensure_ascii=False, indent=2, default=str
+    )
 
     prompt = f"""
 Сейчас: {current_time}
-Часовой пояс пользователя: Europe/Podgorica.
+Часовой пояс Марго: Europe/Podgorica.
 
-Ты анализируешь живую, неструктурированную речь Марго.
-Она может думать вслух, путать даты, менять решение по ходу фразы
-и описывать несколько связанных действий сразу.
+Ты — мозг личного помощника Пинки. Анализируй не отдельную команду, а
+продолжающийся человеческий разговор. Марго может думать вслух, исправлять
+себя и постепенно добавлять детали.
 
-Верни строго JSON.
+Текущее состояние разговора:
+{conversation_json}
 
-Возможные action:
-- "chat" — обычный разговор;
-- "clarify" — нужно уточнение;
-- "create_events" — можно подготовить одно или несколько событий.
+Долговременная память (может быть пустой):
+{memories or "[]"}
 
-Формат ответа:
+Новое сообщение Марго:
+{user_text}
 
+Верни строго JSON с полной актуальной версией плана:
 {{
-  "action": "chat | clarify | create_events",
-  "clarification_question": "вопрос пользователю или пустая строка",
-  "reason": "кратко, почему нужно уточнение или что было понято",
+  "action": "chat | clarify | create_events | update_event | delete_event | delete_events",
+  "clarification_question": "один естественный вопрос или пустая строка",
+  "reason": "кратко, что понято",
+  "target_event_id": "ID только из draft.candidates или пустая строка",
+  "search": {{
+    "text": "слова из названия искомого события",
+    "time_min": "начало диапазона ISO 8601 или пустая строка",
+    "time_max": "конец диапазона ISO 8601 или пустая строка"
+  }},
+  "memory_updates": [
+    {{
+      "operation": "set | delete",
+      "category": "person | place | project | preference",
+      "key": "короткий уникальный ключ",
+      "value": "полный актуальный факт; для delete пустая строка"
+    }}
+  ],
   "events": [
     {{
       "title": "название события",
-      "start_time": "ISO 8601 или пустая строка",
-      "end_time": "ISO 8601 или пустая строка"
+      "start_time": "ISO 8601 с часовым поясом",
+      "end_time": "ISO 8601 с часовым поясом",
+      "description": "дополнительные детали или пустая строка",
+      "location": "адрес/место или пустая строка",
+      "links": ["ссылки из сообщения"],
+      "contacts": ["телефон, email, Telegram или другой способ связи"],
+      "attendees": ["email только для явно приглашённых участников"]
     }}
   ]
 }}
 
 Правила:
-
-1. Проверяй относительные даты по текущей дате.
-2. Если пользователь говорит что-то вроде:
-   "через 3 дня, вроде это 16-е"
-   и эти данные противоречат друг другу,
-   не угадывай — верни action="clarify".
-3. Если не хватает времени начала, даты или другого важного параметра,
-   верни action="clarify".
-4. Если указана длительность события, вычисли end_time.
-5. Если указана дорога до события,
-   создай отдельное событие для выезда.
-6. Если дорога длится 2 часа, а событие начинается в 15:00,
-   событие выезда должно начинаться в 13:00 и заканчиваться в 15:00.
-7. Если длительность основного события не указана,
-   используй 1 час.
-8. Не создавай события сам. Только анализируй.
-9. Для обычного разговора events должен быть пустым списком.
-
-Сообщение Марго:
-{user_text}
+1. Учитывай всю историю, draft и исправления. Новое явное исправление важнее
+   старой информации.
+2. events — полная актуальная версия всех связанных событий, а не только
+   изменения последнего сообщения.
+3. Если есть противоречие или не хватает обязательной даты/времени, верни
+   clarify. Задавай только один самый полезный вопрос за раз.
+4. При clarify сохрани в events уже известные события, только если у них есть
+   полноценные start_time и end_time. Не выдумывай недостающие даты.
+5. Если длительность основной встречи не дана, используй 1 час.
+6. Дорогу и подготовку создавай отдельными событиями и пересчитывай их при
+   переносе основной встречи.
+7. create_events означает, что план полон и его можно показать Марго для
+   подтверждения. Сам ничего не создавай.
+8. update_event используй для переноса или редактирования. В events верни
+   ровно одну полную новую версию события. Старое событие опиши через search.
+9. delete_event используй для удаления. events оставь пустым, старое событие
+   опиши через search.
+10. delete_events используй, когда Марго явно просит удалить все события в
+    указанном диапазоне. Если названа только дата, search.time_min поставь на
+    00:00 этой даты, search.time_max — на 00:00 следующего дня, search.text
+    оставь пустым. Никогда не заменяй указанную дату текущей датой.
+11. Никогда не выдумывай target_event_id. Используй ID только если он уже есть
+    среди candidates в состоянии разговора и Марго однозначно выбрала вариант.
+12. chat используй только для разговора, не связанного с активным планом.
+13. В memory_updates добавляй только устойчивые факты, которые Марго сказала
+    явно: людей, постоянные места, проекты, привычки и предпочтения. Не сохраняй
+    догадки, разовые планы, содержание календарных событий, пароли, токены и
+    секреты. Исправление прежнего факта возвращай как set с тем же key и новым
+    полным value. Просьбу забыть факт возвращай как delete.
+14. Всегда сохраняй явно указанные ссылки в links, способы связи в contacts,
+    адрес в location. Email в contacts не означает приглашение.
+15. Добавляй email в attendees только если Марго явно просит пригласить человека
+    или добавить его участником события. Не отправляй приглашения по догадке.
 """
-    
+
     for attempt in range(3):
         try:
             response = gemini_client.models.generate_content(
-                model="gemini-3-flash-preview",
+                model=GEMINI_BRAIN_MODEL,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                 ),
             )
-
-            return json.loads(response.text)
-
-        except ServerError as error:
+            return validate_intent(json.loads(response.text))
+        except ServerError:
             if attempt == 2:
                 raise
-
             wait_seconds = 2 ** attempt
             print(
                 f"Gemini временно недоступен. "
