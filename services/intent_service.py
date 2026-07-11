@@ -33,6 +33,7 @@ ALLOWED_ACTIONS = {
     "update_event",
     "delete_event",
     "delete_events",
+    "create_reminder",
 }
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -74,12 +75,15 @@ def validate_intent(raw_intent):
         "memory_updates": validate_memory_updates(
             raw_intent.get("memory_updates", [])
         ),
+        "reminder": raw_intent.get("reminder") or {},
     }
 
     if not isinstance(result["events"], list):
         raise ValueError("events должен быть списком")
     if not isinstance(result["search"], dict):
         raise ValueError("search должен быть объектом")
+    if not isinstance(result["reminder"], dict):
+        raise ValueError("reminder должен быть объектом")
     if action == "clarify" and not result["clarification_question"]:
         raise ValueError("Для уточнения нужен вопрос")
     if action == "chat":
@@ -88,6 +92,18 @@ def validate_intent(raw_intent):
         result["events"] = []
     if action == "create_events" and not result["events"]:
         raise ValueError("Для создания нужен хотя бы один event")
+    if action == "create_reminder":
+        reminder_text = str(result["reminder"].get("text", "")).strip()
+        remind_at = _validate_iso_datetime(
+            result["reminder"].get("remind_at"), "remind_at"
+        )
+        if not reminder_text:
+            raise ValueError("У напоминания должен быть текст")
+        result["reminder"] = {
+            "text": reminder_text,
+            "remind_at": remind_at.isoformat(),
+        }
+        result["events"] = []
     if action == "update_event" and len(result["events"]) != 1:
         raise ValueError("Для изменения нужен ровно один новый вариант события")
     if action in {"update_event", "delete_event", "delete_events"}:
@@ -157,7 +173,7 @@ def detect_intent(user_text: str, conversation=None, memories="") -> dict:
 
 Верни строго JSON с полной актуальной версией плана:
 {{
-  "action": "chat | clarify | create_events | update_event | delete_event | delete_events",
+  "action": "chat | clarify | create_events | update_event | delete_event | delete_events | create_reminder",
   "clarification_question": "один естественный вопрос или пустая строка",
   "reason": "кратко, что понято",
   "target_event_id": "ID только из draft.candidates или пустая строка",
@@ -174,6 +190,10 @@ def detect_intent(user_text: str, conversation=None, memories="") -> dict:
       "value": "полный актуальный факт; для delete пустая строка"
     }}
   ],
+  "reminder": {
+    "text": "что именно напомнить или пустая строка",
+    "remind_at": "ISO 8601 с часовым поясом или пустая строка"
+  },
   "events": [
     {{
       "title": "название события",
@@ -222,6 +242,10 @@ def detect_intent(user_text: str, conversation=None, memories="") -> dict:
     адрес в location. Email в contacts не означает приглашение.
 15. Добавляй email в attendees только если Марго явно просит пригласить человека
     или добавить его участником события. Не отправляй приглашения по догадке.
+16. Если Марго говорит «напомни» и это личное напоминание, используй
+    create_reminder, а не Google Calendar. Заполни reminder.text и remind_at.
+    Если точной даты или времени нет — clarify. Фразы «часов в 10» понимай как
+    приблизительное 10:00, если это не создаёт противоречия.
 """
 
     for attempt in range(3):
