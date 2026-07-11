@@ -50,6 +50,8 @@ def apply_intent(conversation, intent):
         "delete_event",
         "delete_events",
         "create_reminder",
+        "delete_reminder",
+        "delete_reminders",
     }:
         updated["state"] = ConversationState.WAITING_FOR_CONFIRMATION
         updated["clarification_question"] = ""
@@ -66,6 +68,8 @@ def apply_intent(conversation, intent):
         "delete_event",
         "delete_events",
         "create_reminder",
+        "delete_reminder",
+        "delete_reminders",
     }:
         updated["draft"] = {
             "operation": action,
@@ -79,6 +83,8 @@ def apply_intent(conversation, intent):
             "targets": [],
             "candidates": [],
             "reminder": intent.get("reminder", {}),
+            "reminder_candidates": [],
+            "target_reminder_ids": intent.get("target_reminder_ids", []),
         }
     elif intent.get("reason"):
         updated.setdefault("draft", {})["reason"] = intent["reason"]
