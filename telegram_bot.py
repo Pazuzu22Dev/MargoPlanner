@@ -5,6 +5,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -59,6 +60,7 @@ memory_store = MemoryStore(MEMORY_PATH)
 action_history_store = ActionHistoryStore(ACTION_HISTORY_PATH)
 reminder_store = ReminderStore(REMINDER_PATH)
 logger = logging.getLogger(__name__)
+LOCAL_TIMEZONE = ZoneInfo("Europe/Podgorica")
 
 if not BOT_TOKEN:
     raise RuntimeError("Не найден TELEGRAM_BOT_TOKEN в .env")
@@ -102,6 +104,16 @@ def format_reminder(reminder):
         f"🔔 {reminder['text']}\n"
         f"🕒 {remind_at.strftime('%d.%m.%Y в %H:%M')}"
     )
+
+
+def format_reminder_list(reminders):
+    lines = []
+    for number, reminder in enumerate(reminders, start=1):
+        remind_at = datetime.fromisoformat(reminder["remind_at"]).astimezone(
+            LOCAL_TIMEZONE
+        )
+        lines.append(f"{number}. {remind_at.strftime('%H:%M')} — {reminder['text']}")
+    return "\n".join(lines)
 
 
 async def reminder_dispatcher(application):
@@ -618,6 +630,26 @@ async def process_user_text(update, context, user_text):
             + format_reminder(reminder)
             + "\n\nПодтвердить? Ответьте «да» или «нет»."
         )
+        return
+
+    if action == "list_reminders":
+        search = intent["search"]
+        reminders = await asyncio.to_thread(
+            reminder_store.list_pending,
+            update.effective_user.id,
+            search["time_min"],
+            search["time_max"],
+        )
+        clear_conversation(context)
+        if reminders:
+            await update.message.reply_text(
+                "Вот твои активные напоминания:\n\n"
+                + format_reminder_list(reminders)
+            )
+        else:
+            await update.message.reply_text(
+                "На этот период активных напоминаний нет. ✨"
+            )
         return
 
     if action in {"update_event", "delete_event", "delete_events"}:
