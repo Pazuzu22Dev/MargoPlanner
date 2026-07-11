@@ -79,6 +79,47 @@ class ReminderStore:
             for row in rows
         ]
 
+    def search_pending(self, user_id, search):
+        clauses = ["user_id = ?", "status = 'pending'"]
+        parameters = [user_id]
+        for field, operator in (("time_min", ">="), ("time_max", "<")):
+            if search.get(field):
+                parsed = datetime.fromisoformat(search[field])
+                if parsed.tzinfo is None:
+                    raise ValueError("Время поиска должно содержать часовой пояс")
+                clauses.append(f"remind_at {operator} ?")
+                parameters.append(parsed.astimezone(timezone.utc).isoformat())
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, user_id, text, remind_at FROM reminders WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY remind_at",
+                parameters,
+            ).fetchall()
+        reminders = [
+            {"id": row[0], "user_id": row[1], "text": row[2], "remind_at": row[3]}
+            for row in rows
+        ]
+        query = str(search.get("text", "")).strip().casefold()
+        if query:
+            reminders = [
+                item for item in reminders if query in item["text"].casefold()
+            ]
+        return reminders
+
+    def delete_pending(self, user_id, reminder_ids):
+        ids = [int(item) for item in reminder_ids]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"DELETE FROM reminders WHERE user_id = ? AND status = 'pending' "
+                f"AND id IN ({placeholders})",
+                [user_id, *ids],
+            )
+            return cursor.rowcount
+
     def mark_sent(self, reminder_id):
         with self._connect() as connection:
             connection.execute(
