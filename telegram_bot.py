@@ -372,6 +372,28 @@ async def process_user_text(update, context, user_text):
 
         if state == ConversationState.WAITING_FOR_CLARIFICATION:
             draft = conversation.get("draft", {})
+            reminder_candidates = draft.get("reminder_candidates", [])
+            reminder_indexes = parse_candidate_selection(
+                user_text,
+                len(reminder_candidates),
+            )
+            if (
+                reminder_indexes is not None
+                and draft.get("operation") == "delete_reminder"
+            ):
+                targets = [reminder_candidates[index] for index in reminder_indexes]
+                draft["operation"] = (
+                    "delete_reminders" if len(targets) > 1 else "delete_reminder"
+                )
+                draft["reminder_targets"] = targets
+                conversation["state"] = ConversationState.WAITING_FOR_CONFIRMATION
+                save_conversation(context, conversation)
+                await update.message.reply_text(
+                    "Удалить напоминания:\n\n"
+                    + format_reminder_list(targets)
+                    + "\n\nПодтвердить? Ответьте «да» или «нет»."
+                )
+                return
             candidates = draft.get("candidates", [])
             selected_indexes = parse_candidate_selection(
                 user_text,
@@ -403,6 +425,18 @@ async def process_user_text(update, context, user_text):
             events = draft.get("events", [])
 
             if normalized_text in YES_ANSWERS:
+                if operation in {"delete_reminder", "delete_reminders"}:
+                    targets = draft["reminder_targets"]
+                    deleted = await asyncio.to_thread(
+                        reminder_store.delete_pending,
+                        update.effective_user.id,
+                        [item["id"] for item in targets],
+                    )
+                    clear_conversation(context)
+                    await update.message.reply_text(
+                        f"Готово. Удалила напоминаний: {deleted}."
+                    )
+                    return
                 if operation == "create_reminder":
                     reminder = draft["reminder"]
                     await asyncio.to_thread(
@@ -640,16 +674,65 @@ async def process_user_text(update, context, user_text):
             search["time_min"],
             search["time_max"],
         )
-        clear_conversation(context)
         if reminders:
+            conversation["state"] = ConversationState.IDLE
+            conversation["draft"] = {
+                "operation": "list_reminders",
+                "events": [],
+                "reminder_candidates": reminders,
+            }
+            save_conversation(context, conversation)
             await update.message.reply_text(
                 "Вот твои активные напоминания:\n\n"
                 + format_reminder_list(reminders)
             )
         else:
+            clear_conversation(context)
             await update.message.reply_text(
                 "На этот период активных напоминаний нет. ✨"
             )
+        return
+
+    if action in {"delete_reminder", "delete_reminders"}:
+        previous = conversation.get("draft", {}).get("reminder_candidates", [])
+        requested_ids = set(intent.get("target_reminder_ids", []))
+        targets = [item for item in previous if item["id"] in requested_ids]
+        if not targets:
+            targets = await asyncio.to_thread(
+                reminder_store.search_pending,
+                update.effective_user.id,
+                intent.get("search", {}),
+            )
+        if not targets:
+            clear_conversation(context)
+            await update.message.reply_text("Подходящих активных напоминаний нет.")
+            return
+        if action == "delete_reminder" and len(targets) > 1:
+            conversation["state"] = ConversationState.WAITING_FOR_CLARIFICATION
+            conversation["draft"] = {
+                "operation": "delete_reminder",
+                "events": [],
+                "reminder_candidates": targets,
+            }
+            save_conversation(context, conversation)
+            await update.message.reply_text(
+                "Нашла несколько напоминаний:\n\n"
+                + format_reminder_list(targets)
+                + "\n\nКакое удалить? Напиши номер."
+            )
+            return
+        conversation["state"] = ConversationState.WAITING_FOR_CONFIRMATION
+        conversation["draft"] = {
+            "operation": "delete_reminders" if len(targets) > 1 else "delete_reminder",
+            "events": [],
+            "reminder_targets": targets,
+        }
+        save_conversation(context, conversation)
+        await update.message.reply_text(
+            "Удалить напоминания:\n\n"
+            + format_reminder_list(targets)
+            + "\n\nПодтвердить? Ответьте «да» или «нет»."
+        )
         return
 
     if action in {"update_event", "delete_event", "delete_events"}:
