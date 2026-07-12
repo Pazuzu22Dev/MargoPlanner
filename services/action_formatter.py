@@ -14,7 +14,8 @@ WEEKDAYS = (
 
 def format_ru_date(value):
     parsed = value if isinstance(value, (date, datetime)) else date.fromisoformat(value)
-    return f"{parsed.day} {MONTHS[parsed.month - 1]}, {WEEKDAYS[parsed.weekday()]}"
+    weekday = WEEKDAYS[parsed.weekday()].capitalize()
+    return f"{weekday}, {parsed.day} {MONTHS[parsed.month - 1]}"
 
 
 def format_calendar_action(data, timezone_name="Europe/Podgorica"):
