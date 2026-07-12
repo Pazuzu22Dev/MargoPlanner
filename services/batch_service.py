@@ -47,7 +47,7 @@ def analyze_batch(plan):
                 entry.update(
                     classification="exact_duplicate",
                     existing=exact,
-                    decision="skip",
+                    decision=None,
                 )
             elif existing:
                 entry.update(
@@ -65,7 +65,11 @@ def batch_counts(analysis):
         "free": sum(item["classification"] == "free" for item in analysis),
         "duplicates": sum(item["classification"] == "exact_duplicate" for item in analysis),
         "conflicts": sum(item["classification"] == "conflict" for item in analysis),
-        "remaining": sum(item["classification"] == "conflict" and item["decision"] is None for item in analysis),
+        "remaining": sum(
+            item["classification"] in {"conflict", "exact_duplicate"}
+            and item["decision"] is None
+            for item in analysis
+        ),
     }
 
 
@@ -89,6 +93,20 @@ def format_conflict(plan, entry):
         "Уже в календаре:\n"
         + "\n\n".join(existing_blocks)
         + "\n\nНовое событие:\n"
+        + format_calendar_action(new_data)
+    )
+
+
+def format_duplicate(plan, entry):
+    new_data = plan["actions"][entry["action_index"]]["data"]
+    existing_blocks = [
+        format_calendar_action(event) for event in entry["existing"]
+    ]
+    return (
+        "🟰 Возможный дубль\n\n"
+        "Уже есть в календаре:\n"
+        + "\n\n".join(existing_blocks)
+        + "\n\nНовая версия:\n"
         + format_calendar_action(new_data)
     )
 
