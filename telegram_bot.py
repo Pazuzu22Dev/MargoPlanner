@@ -60,7 +60,7 @@ from services.extraction_service import extract_content
 from services.input_service import InputPayload, detect_message_input
 from services.input_dedup_service import InputDedupStore
 from services.markdown_schedule_service import (
-    is_markdown_table,
+    looks_like_schedule,
     parse_markdown_shifts,
 )
 from services.planner_service import build_plan
@@ -361,10 +361,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     if not user_text:
         return
-    if (
-        detect_message_input(update.message) == "forwarded_message"
-        and is_markdown_table(user_text)
-    ):
+    if looks_like_schedule(user_text):
         message_key = f"forwarded:{update.effective_chat.id}:{update.message.message_id}"
         if not await asyncio.to_thread(
             input_dedup_store.claim,
