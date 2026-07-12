@@ -49,12 +49,15 @@ from services.action_executor import (
     execute_batch,
     execute_plan,
     format_plan,
+    summarize_plan_execution,
 )
 from services.batch_service import (
     analyze_batch,
+    batch_followup_response,
     batch_counts,
     format_batch_report,
     format_conflict,
+    format_execution_report,
 )
 from services.extraction_service import extract_content
 from services.input_service import (
@@ -365,6 +368,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     if not user_text:
         return
+    replied = getattr(update.message, "reply_to_message", None)
+    if replied:
+        attachment = get_message_attachment(replied)
+        if attachment:
+            await process_message_attachment(
+                update,
+                context,
+                replied,
+                user_text,
+            )
+            return
+        replied_text = (
+            getattr(replied, "text", None)
+            or getattr(replied, "caption", None)
+            or ""
+        ).strip()
+        if replied_text:
+            if looks_like_schedule(replied_text):
+                await update.message.reply_text(
+                    "🔎 Читаю таблицу из сообщения, на которое ты ответила..."
+                )
+                plan = await asyncio.to_thread(parse_markdown_shifts, replied_text)
+                await present_universal_plan(
+                    update,
+                    context,
+                    plan,
+                    replied_text,
+                    user_text,
+                )
+                return
+            user_text = (
+                "Пользователь отвечает на сообщение:\n\n"
+                + replied_text
+                + "\n\nНовое сообщение пользователя:\n\n"
+                + user_text
+            )
     if looks_like_schedule(user_text):
         message_key = f"forwarded:{update.effective_chat.id}:{update.message.message_id}"
         if not await asyncio.to_thread(
@@ -466,7 +505,10 @@ async def show_next_batch_conflict(message, context, conversation):
 async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorize_update(update):
         return
-    message = update.effective_message
+    await process_message_attachment(update, context, update.effective_message)
+
+
+async def process_message_attachment(update, context, message, user_request=""):
     source_type = detect_message_input(message)
     attachment = get_message_attachment(message)
     logger.info(
@@ -507,7 +549,12 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mime_type=mime_type,
         caption=message.caption or "",
     )
-    await process_universal_payload(update, context, payload, message.caption or "")
+    await process_universal_payload(
+        update,
+        context,
+        payload,
+        user_request or message.caption or "",
+    )
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -620,19 +667,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reminder_store,
                 draft.get("duplicate_indexes", []),
             )
-            summary = {
-                "created": sum(item["status"] == "done" for item in results),
-                "skipped": sum(item["status"] == "skipped_duplicate" for item in results),
-                "replaced": 0,
-                "cancelled": 0,
-            }
+            summary = summarize_plan_execution(draft["plan"], results)
+        context.user_data["last_batch_report"] = summary
         clear_conversation(context)
         await query.message.reply_text(
-            "Готово. Итог batch:\n"
-            f"Создано: {summary['created']}\n"
-            f"Пропущено: {summary['skipped']}\n"
-            f"Заменено: {summary['replaced']}\n"
-            f"Отменено: {summary['cancelled']}"
+            "Готово. Итог batch:\n\n" + format_execution_report(summary)
         )
         return
     if data == "plan:edit":
@@ -707,6 +746,16 @@ async def process_user_text(update, context, user_text):
     normalized_text = user_text.lower()
 
     conversation = get_conversation(context)
+
+    if not conversation:
+        last_batch_report = context.user_data.get("last_batch_report")
+        followup = (
+            batch_followup_response(user_text, last_batch_report)
+            if last_batch_report else None
+        )
+        if followup:
+            await update.message.reply_text(followup)
+            return
 
     if normalized_text in UNDO_REQUESTS:
         action = await asyncio.to_thread(action_history_store.get_last_active)
@@ -890,19 +939,12 @@ async def process_user_text(update, context, user_text):
                             reminder_store,
                             draft.get("duplicate_indexes", []),
                         )
-                        summary = {
-                            "created": sum(item["status"] == "done" for item in results),
-                            "skipped": sum(item["status"] == "skipped_duplicate" for item in results),
-                            "replaced": 0,
-                            "cancelled": 0,
-                        }
+                        summary = summarize_plan_execution(draft["plan"], results)
+                    context.user_data["last_batch_report"] = summary
                     clear_conversation(context)
                     await update.message.reply_text(
-                        "Готово. Итог batch:\n"
-                        f"Создано: {summary['created']}\n"
-                        f"Пропущено: {summary['skipped']}\n"
-                        f"Заменено: {summary['replaced']}\n"
-                        f"Отменено: {summary['cancelled']}"
+                        "Готово. Итог batch:\n\n"
+                        + format_execution_report(summary)
                     )
                     return
                 if operation in {"delete_reminder", "delete_reminders"}:
