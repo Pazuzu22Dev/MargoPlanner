@@ -53,6 +53,10 @@ from services.action_executor import (
 from services.extraction_service import extract_content
 from services.input_service import InputPayload, detect_message_input
 from services.input_dedup_service import InputDedupStore
+from services.markdown_schedule_service import (
+    is_markdown_table,
+    parse_markdown_shifts,
+)
 from services.planner_service import build_plan
 
 
@@ -163,7 +167,7 @@ def reminder_actions_keyboard():
 
 def plan_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Выполнить всё", callback_data="plan:execute")],
+        [InlineKeyboardButton("✅ Добавить всё", callback_data="plan:execute")],
         [InlineKeyboardButton("✏️ Исправить", callback_data="plan:edit")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
     ])
@@ -341,13 +345,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     if not user_text:
         return
-    if detect_message_input(update.message) == "forwarded_message":
-        await process_universal_payload(
-            update,
-            context,
-            InputPayload("forwarded_message", user_text),
-            user_text,
-        )
+    if (
+        detect_message_input(update.message) == "forwarded_message"
+        and is_markdown_table(user_text)
+    ):
+        message_key = f"forwarded:{update.effective_chat.id}:{update.message.message_id}"
+        if not await asyncio.to_thread(
+            input_dedup_store.claim,
+            message_key,
+            user_text.encode("utf-8"),
+        ):
+            await update.message.reply_text(
+                "Это расписание я уже недавно обработала. Используй готовый план выше."
+            )
+            return
+        await update.message.reply_text("🔎 Читаю таблицу и ищу смены Марго...")
+        plan = await asyncio.to_thread(parse_markdown_shifts, user_text)
+        await present_universal_plan(update, context, plan, user_text, "Расписание Валеры")
         return
     await process_user_text(update, context, user_text)
 
@@ -362,6 +376,10 @@ async def process_universal_payload(update, context, payload, user_request=""):
         user_request or payload.caption,
         memories,
     )
+    await present_universal_plan(update, context, plan, extracted, user_request)
+
+
+async def present_universal_plan(update, context, plan, extracted, user_request=""):
     if plan["clarification_question"]:
         conversation = new_conversation(user_request or payload.caption or "Импорт")
         conversation["state"] = ConversationState.WAITING_FOR_CLARIFICATION
