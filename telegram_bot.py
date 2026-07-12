@@ -64,6 +64,7 @@ from services.extraction_service import extract_content
 from services.input_service import (
     InputPayload,
     detect_message_input,
+    extract_rich_message_text,
     get_message_attachment,
     is_structured_telegram_text,
     normalize_telegram_message,
@@ -1580,6 +1581,27 @@ async def handle_unrecognized_message(
         "Unhandled Telegram message payload: %r",
         message.to_dict() if message else None,
     )
+    rich_text = extract_rich_message_text(message) if message else ""
+    if rich_text:
+        context.user_data["last_structured_input"] = rich_text
+        await message.reply_text("🔎 Читаю пересланную таблицу...")
+        plan = await asyncio.to_thread(parse_markdown_shifts, rich_text)
+        if plan is not None:
+            await present_universal_plan(
+                update,
+                context,
+                plan,
+                rich_text,
+                "Добавить смены Марго из пересланного расписания",
+            )
+        else:
+            await process_universal_payload(
+                update,
+                context,
+                InputPayload("forwarded_message", rich_text),
+                "Проанализируй пересланные структурированные данные",
+            )
+        return
     if message:
         await message.reply_text(
             "Я получила сообщение, но Telegram передал его в формате, который "
