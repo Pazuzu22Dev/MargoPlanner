@@ -399,6 +399,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "external_reply=%r\nexternal_reply.photo=%s\n"
         "external_reply.document=%s\n"
         "message.quote=%r\nquote_text=%r\n"
+        "reply_object_present=%s\nmessage.api_kwargs=%r\n"
         "reply_text_length=%s\nmessage.forward_origin=%r\nsource_type=%s\n"
         "photo=%s document=%s voice=%s\nnormalized_input=%r",
         normalized.main_text,
@@ -415,6 +416,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bool(getattr(external_reply, "document", None)),
         getattr(update.message, "quote", None),
         normalized.quote_text,
+        replied is not None,
+        getattr(update.message, "api_kwargs", None),
         len(normalized.reply_text),
         getattr(update.message, "forward_origin", None),
         normalized.source_type,
@@ -461,6 +464,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context,
             InputPayload("forwarded_message", saved_context),
             user_text,
+        )
+        return
+    if (
+        vague_reference
+        and not saved_context
+        and not get_conversation(context)
+        and not any((
+            normalized.reply_text,
+            normalized.reply_caption,
+            normalized.quote_text,
+            normalized.attachment_message,
+            external_reply,
+        ))
+    ):
+        await update.message.reply_text(
+            "Пока нет: Telegram передал мне только сообщение «Видишь?», без "
+            "видимой у тебя цитаты. Чтобы я прочитала таблицу, открой исходное "
+            "сообщение, нажми «Переслать» и выбери MargoPlanner — не используй "
+            "«Ответить». Ещё можно отправить скриншот отдельным фото."
         )
         return
 
@@ -1545,6 +1567,25 @@ async def process_user_text(update, context, user_text):
 
 async def handle_error(update, context):
     logger.exception("Ошибка при обработке Telegram update", exc_info=context.error)
+
+
+async def handle_unrecognized_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not await authorize_update(update):
+        return
+    message = update.effective_message
+    logger.info(
+        "Unhandled Telegram message payload: %r",
+        message.to_dict() if message else None,
+    )
+    if message:
+        await message.reply_text(
+            "Я получила сообщение, но Telegram передал его в формате, который "
+            "я пока не умею читать. Отправь его отдельным фото, документом или "
+            "обычной пересылкой — не через Reply/цитату."
+        )
     if (
         isinstance(update, Update)
         and update.effective_message
@@ -1588,6 +1629,7 @@ def main():
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
+    app.add_handler(MessageHandler(filters.ALL, handle_unrecognized_message))
     app.add_error_handler(handle_error)
 
     print("Бот запущен...")
