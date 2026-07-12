@@ -58,6 +58,7 @@ from services.batch_service import (
     format_batch_report,
     format_conflict,
     format_execution_report,
+    find_retry_action,
 )
 from services.extraction_service import extract_content
 from services.input_service import (
@@ -181,6 +182,23 @@ def reminder_actions_keyboard():
 def plan_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Добавить всё", callback_data="plan:execute")],
+        [InlineKeyboardButton("✏️ Исправить", callback_data="plan:edit")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+    ])
+
+
+def batch_actions_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "✅ Создать только без конфликтов",
+            callback_data="batchall:safe",
+        )],
+        [InlineKeyboardButton("⚠️ Создать всё", callback_data="batchall:all")],
+        [InlineKeyboardButton("🧹 Удалить дубли", callback_data="batchall:dedupe")],
+        [InlineKeyboardButton(
+            "🔎 Разобрать конфликты",
+            callback_data="batchall:review",
+        )],
         [InlineKeyboardButton("✏️ Исправить", callback_data="plan:edit")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
     ])
@@ -466,14 +484,8 @@ async def present_universal_plan(update, context, plan, extracted, user_request=
         + "\n\nПолный план:\n\n"
         + format_plan(plan)
         + notes_text,
-        reply_markup=None if counts["remaining"] else plan_keyboard(),
+        reply_markup=batch_actions_keyboard(),
     )
-    if counts["remaining"]:
-        await show_next_batch_conflict(
-            update.effective_message,
-            context,
-            conversation,
-        )
 
 
 async def show_next_batch_conflict(message, context, conversation):
@@ -499,6 +511,32 @@ async def show_next_batch_conflict(message, context, conversation):
         format_conflict(draft["plan"], current)
         + f"\n\nОсталось разобрать конфликтов: {len(unresolved)}",
         reply_markup=conflict_keyboard(),
+    )
+
+
+async def execute_saved_batch(message, context, user_id, conversation):
+    draft = conversation["draft"]
+    if draft.get("batch_analysis"):
+        summary = await asyncio.to_thread(
+            execute_batch,
+            draft["plan"],
+            draft["batch_analysis"],
+            user_id,
+            reminder_store,
+        )
+    else:
+        results = await asyncio.to_thread(
+            execute_plan,
+            draft["plan"],
+            user_id,
+            reminder_store,
+            draft.get("duplicate_indexes", []),
+        )
+        summary = summarize_plan_execution(draft["plan"], results)
+    context.user_data["last_batch_report"] = summary
+    clear_conversation(context)
+    await message.reply_text(
+        "Готово. Итог batch:\n\n" + format_execution_report(summary)
     )
 
 
@@ -619,6 +657,47 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     conversation = get_conversation(context)
+    if data.startswith("batchall:"):
+        if not conversation or conversation.get("draft", {}).get("operation") not in {
+            "universal_batch_review",
+            "universal_plan",
+        }:
+            await query.message.reply_text("Этот batch уже неактуален.")
+            return
+        draft = conversation["draft"]
+        choice = data.split(":", 1)[1]
+        if choice == "review":
+            draft["operation"] = "universal_batch_review"
+            save_conversation(context, conversation)
+            await show_next_batch_conflict(query.message, context, conversation)
+            return
+        for entry in draft.get("batch_analysis", []):
+            if choice == "all":
+                entry["decision"] = "create"
+            elif entry["classification"] == "exact_duplicate":
+                entry["decision"] = "skip"
+            elif choice == "safe" and entry["classification"] == "conflict":
+                entry["decision"] = "skip"
+        if choice == "dedupe":
+            unresolved = [
+                entry for entry in draft.get("batch_analysis", [])
+                if entry["classification"] == "conflict" and entry["decision"] is None
+            ]
+            if unresolved:
+                draft["operation"] = "universal_batch_review"
+                save_conversation(context, conversation)
+                await query.message.reply_text(
+                    "Точные дубли исключены. Теперь разберём пересечения."
+                )
+                await show_next_batch_conflict(query.message, context, conversation)
+                return
+        await execute_saved_batch(
+            query.message,
+            context,
+            update.effective_user.id,
+            conversation,
+        )
+        return
     if data.startswith("batch:"):
         if not conversation or conversation.get("draft", {}).get("operation") != "universal_batch_review":
             await query.message.reply_text("Этот batch уже неактуален.")
@@ -650,32 +729,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not conversation or conversation.get("draft", {}).get("operation") != "universal_plan":
             await query.message.reply_text("Этот план уже неактуален.")
             return
-        draft = conversation["draft"]
-        if draft.get("batch_analysis"):
-            summary = await asyncio.to_thread(
-                execute_batch,
-                draft["plan"],
-                draft["batch_analysis"],
-                update.effective_user.id,
-                reminder_store,
-            )
-        else:
-            results = await asyncio.to_thread(
-                execute_plan,
-                draft["plan"],
-                update.effective_user.id,
-                reminder_store,
-                draft.get("duplicate_indexes", []),
-            )
-            summary = summarize_plan_execution(draft["plan"], results)
-        context.user_data["last_batch_report"] = summary
-        clear_conversation(context)
-        await query.message.reply_text(
-            "Готово. Итог batch:\n\n" + format_execution_report(summary)
+        await execute_saved_batch(
+            query.message,
+            context,
+            update.effective_user.id,
+            conversation,
         )
         return
     if data == "plan:edit":
-        if not conversation or conversation.get("draft", {}).get("operation") != "universal_plan":
+        if not conversation or conversation.get("draft", {}).get("operation") not in {
+            "universal_plan",
+            "universal_batch_review",
+        }:
             await query.message.reply_text("Этот план уже неактуален.")
             return
         conversation["state"] = ConversationState.WAITING_FOR_CLARIFICATION
@@ -749,6 +814,41 @@ async def process_user_text(update, context, user_text):
 
     if not conversation:
         last_batch_report = context.user_data.get("last_batch_report")
+        retry_action = (
+            find_retry_action(user_text, last_batch_report)
+            if last_batch_report else None
+        )
+        if retry_action:
+            plan = {
+                "actions": [retry_action],
+                "clarification_question": "",
+                "notes": [],
+            }
+            analysis = await asyncio.to_thread(analyze_batch, plan)
+            if analysis[0]["classification"] == "exact_duplicate":
+                analysis[0]["decision"] = "create"
+            conversation = new_conversation(user_text)
+            conversation["state"] = ConversationState.WAITING_FOR_CONFIRMATION
+            conversation["draft"] = {
+                "operation": (
+                    "universal_batch_review"
+                    if analysis[0]["decision"] is None else "universal_plan"
+                ),
+                "plan": plan,
+                "batch_analysis": analysis,
+                "extracted": "Повтор элемента из последнего batch",
+            }
+            save_conversation(context, conversation)
+            await update.message.reply_text(
+                "Нашла этот элемент в последнем batch:\n\n"
+                + format_plan(plan),
+                reply_markup=(
+                    None if analysis[0]["decision"] is None else plan_keyboard()
+                ),
+            )
+            if analysis[0]["decision"] is None:
+                await show_next_batch_conflict(update.message, context, conversation)
+            return
         followup = (
             batch_followup_response(user_text, last_batch_report)
             if last_batch_report else None
