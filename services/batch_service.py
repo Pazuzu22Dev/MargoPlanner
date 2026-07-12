@@ -79,3 +79,45 @@ def format_conflict(plan, entry):
         + "\n\nНовое событие:\n"
         + format_calendar_action(new_data)
     )
+
+
+def format_execution_report(summary, statuses=None):
+    labels = {
+        "created": "Создано",
+        "skipped": "Пропущено",
+        "replaced": "Заменено",
+        "cancelled": "Отменено",
+    }
+    selected = statuses or tuple(labels)
+    sections = []
+    for status in selected:
+        entries = [item for item in summary.get("details", []) if item["status"] == status]
+        if not entries:
+            continue
+        lines = []
+        for entry in entries:
+            action = entry["action"]
+            data = action["data"]
+            if action["action"] in {"create_calendar_event", "update_calendar_event"}:
+                rendered = format_calendar_action(data).replace("\n", " · ")
+            else:
+                rendered = data.get("text") or data.get("title") or action["action"]
+            lines.append(f"• {rendered} — {entry['reason']}")
+        sections.append(labels[status] + ":\n" + "\n".join(lines))
+    return "\n\n".join(sections) or "В этой категории ничего нет."
+
+
+def batch_followup_response(user_text, summary):
+    normalized = user_text.casefold()
+    status = None
+    if "пропущ" in normalized:
+        status = "skipped"
+    elif "замен" in normalized:
+        status = "replaced"
+    elif "создан" in normalized or "добавлен" in normalized:
+        status = "created"
+    elif "отмен" in normalized:
+        status = "cancelled"
+    if status is None:
+        return None
+    return format_execution_report(summary, (status,))
