@@ -120,6 +120,23 @@ class ReminderStore:
             )
             return cursor.rowcount
 
+    def update_pending(self, user_id, reminder_id, text, remind_at):
+        parsed = datetime.fromisoformat(remind_at)
+        if parsed.tzinfo is None:
+            raise ValueError("Время напоминания должно содержать часовой пояс")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE reminders SET text = ?, remind_at = ? "
+                "WHERE id = ? AND user_id = ? AND status = 'pending'",
+                (
+                    text.strip(),
+                    parsed.astimezone(timezone.utc).isoformat(),
+                    int(reminder_id),
+                    user_id,
+                ),
+            )
+            return cursor.rowcount
+
     def mark_sent(self, reminder_id):
         with self._connect() as connection:
             connection.execute(
