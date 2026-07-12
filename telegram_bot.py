@@ -46,9 +46,15 @@ from services.memory_service import MemoryStore
 from services.voice_service import VoiceQuotaError, transcribe_voice
 from services.reminder_service import ReminderStore
 from services.action_executor import (
+    execute_batch,
     execute_plan,
-    find_duplicate_actions,
     format_plan,
+)
+from services.batch_service import (
+    analyze_batch,
+    batch_counts,
+    format_batch_report,
+    format_conflict,
 )
 from services.extraction_service import extract_content
 from services.input_service import InputPayload, detect_message_input
@@ -170,6 +176,16 @@ def plan_keyboard():
         [InlineKeyboardButton("✅ Добавить всё", callback_data="plan:execute")],
         [InlineKeyboardButton("✏️ Исправить", callback_data="plan:edit")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+    ])
+
+
+def conflict_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Оставить существующее", callback_data="batch:keep")],
+        [InlineKeyboardButton("🔁 Заменить новым", callback_data="batch:replace")],
+        [InlineKeyboardButton("➕ Оставить оба", callback_data="batch:both")],
+        [InlineKeyboardButton("✏️ Изменить новое", callback_data="batch:edit")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="batch:cancel")],
     ])
 
 
@@ -381,7 +397,7 @@ async def process_universal_payload(update, context, payload, user_request=""):
 
 async def present_universal_plan(update, context, plan, extracted, user_request=""):
     if plan["clarification_question"]:
-        conversation = new_conversation(user_request or payload.caption or "Импорт")
+        conversation = new_conversation(user_request or "Импорт")
         conversation["state"] = ConversationState.WAITING_FOR_CLARIFICATION
         conversation["draft"] = {
             "operation": "universal_plan_edit",
@@ -391,29 +407,58 @@ async def present_universal_plan(update, context, plan, extracted, user_request=
         save_conversation(context, conversation)
         await update.effective_message.reply_text(plan["clarification_question"])
         return
-    duplicates = await asyncio.to_thread(find_duplicate_actions, plan)
-    skipped = [item["action_index"] for item in duplicates]
-    conversation = new_conversation(user_request or payload.caption or "Импорт")
+    analysis = await asyncio.to_thread(analyze_batch, plan)
+    counts = batch_counts(analysis)
+    conversation = new_conversation(user_request or "Импорт")
     conversation["state"] = ConversationState.WAITING_FOR_CONFIRMATION
     conversation["draft"] = {
-        "operation": "universal_plan",
+        "operation": "universal_batch_review" if counts["remaining"] else "universal_plan",
         "plan": plan,
-        "duplicate_indexes": skipped,
+        "batch_analysis": analysis,
         "extracted": extracted if isinstance(extracted, str) else "Изображение",
     }
     save_conversation(context, conversation)
-    duplicate_text = (
-        f"\n\n⚠️ Возможных дубликатов: {len(skipped)}. Я пропущу их."
-        if skipped else ""
-    )
     notes = [str(note).strip() for note in plan.get("notes", []) if str(note).strip()]
     notes_text = "\n\n⚠️ " + "\n⚠️ ".join(notes) if notes else ""
     await update.effective_message.reply_text(
-        "Я подготовила план:\n\n"
+        "Я обработала весь список.\n\n"
+        + format_batch_report(analysis)
+        + "\n\nПолный план:\n\n"
         + format_plan(plan)
-        + duplicate_text
         + notes_text,
-        reply_markup=plan_keyboard(),
+        reply_markup=None if counts["remaining"] else plan_keyboard(),
+    )
+    if counts["remaining"]:
+        await show_next_batch_conflict(
+            update.effective_message,
+            context,
+            conversation,
+        )
+
+
+async def show_next_batch_conflict(message, context, conversation):
+    draft = conversation["draft"]
+    analysis = draft["batch_analysis"]
+    unresolved = [
+        item for item in analysis
+        if item["classification"] == "conflict" and item["decision"] is None
+    ]
+    if not unresolved:
+        draft["operation"] = "universal_plan"
+        conversation["state"] = ConversationState.WAITING_FOR_CONFIRMATION
+        save_conversation(context, conversation)
+        await message.reply_text(
+            "Все конфликты разобраны. Batch готов к выполнению.",
+            reply_markup=plan_keyboard(),
+        )
+        return
+    current = unresolved[0]
+    draft["current_conflict_index"] = current["action_index"]
+    save_conversation(context, conversation)
+    await message.reply_text(
+        format_conflict(draft["plan"], current)
+        + f"\n\nОсталось разобрать конфликтов: {len(unresolved)}",
+        reply_markup=conflict_keyboard(),
     )
 
 
@@ -518,24 +563,67 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     conversation = get_conversation(context)
+    if data.startswith("batch:"):
+        if not conversation or conversation.get("draft", {}).get("operation") != "universal_batch_review":
+            await query.message.reply_text("Этот batch уже неактуален.")
+            return
+        draft = conversation["draft"]
+        action_index = draft.get("current_conflict_index")
+        entry = next(
+            item for item in draft["batch_analysis"]
+            if item["action_index"] == action_index
+        )
+        choice = data.split(":", 1)[1]
+        if choice == "edit":
+            draft["operation"] = "universal_batch_edit"
+            conversation["state"] = ConversationState.WAITING_FOR_CLARIFICATION
+            save_conversation(context, conversation)
+            await query.message.reply_text(
+                "Как изменить новое событие? Напиши новую дату, время или другие детали."
+            )
+            return
+        entry["decision"] = {
+            "keep": "skip",
+            "replace": "replace",
+            "both": "create",
+            "cancel": "cancel",
+        }[choice]
+        await show_next_batch_conflict(query.message, context, conversation)
+        return
     if data == "plan:execute":
         if not conversation or conversation.get("draft", {}).get("operation") != "universal_plan":
             await query.message.reply_text("Этот план уже неактуален.")
             return
         draft = conversation["draft"]
-        results = await asyncio.to_thread(
-            execute_plan,
-            draft["plan"],
-            update.effective_user.id,
-            reminder_store,
-            draft.get("duplicate_indexes", []),
-        )
-        done = sum(item["status"] == "done" for item in results)
-        skipped = sum(item["status"] == "skipped_duplicate" for item in results)
+        if draft.get("batch_analysis"):
+            summary = await asyncio.to_thread(
+                execute_batch,
+                draft["plan"],
+                draft["batch_analysis"],
+                update.effective_user.id,
+                reminder_store,
+            )
+        else:
+            results = await asyncio.to_thread(
+                execute_plan,
+                draft["plan"],
+                update.effective_user.id,
+                reminder_store,
+                draft.get("duplicate_indexes", []),
+            )
+            summary = {
+                "created": sum(item["status"] == "done" for item in results),
+                "skipped": sum(item["status"] == "skipped_duplicate" for item in results),
+                "replaced": 0,
+                "cancelled": 0,
+            }
         clear_conversation(context)
         await query.message.reply_text(
-            f"Готово. Выполнено действий: {done}."
-            + (f" Дубликатов пропущено: {skipped}." if skipped else "")
+            "Готово. Итог batch:\n"
+            f"Создано: {summary['created']}\n"
+            f"Пропущено: {summary['skipped']}\n"
+            f"Заменено: {summary['replaced']}\n"
+            f"Отменено: {summary['cancelled']}"
         )
         return
     if data == "plan:edit":
@@ -650,6 +738,38 @@ async def process_user_text(update, context, user_text):
 
         if state == ConversationState.WAITING_FOR_CLARIFICATION:
             draft = conversation.get("draft", {})
+            if draft.get("operation") == "universal_batch_edit":
+                action_index = draft["current_conflict_index"]
+                current_action = draft["plan"]["actions"][action_index]
+                memories = await asyncio.to_thread(memory_store.as_prompt_context)
+                revised = await asyncio.to_thread(
+                    build_plan,
+                    str(current_action),
+                    "Исправление пользователя: " + user_text,
+                    memories,
+                )
+                if revised["clarification_question"] or len(revised["actions"]) != 1:
+                    await update.message.reply_text(
+                        revised["clarification_question"]
+                        or "Опиши одно новое время для этого события."
+                    )
+                    return
+                draft["plan"]["actions"][action_index] = revised["actions"][0]
+                refreshed = await asyncio.to_thread(
+                    analyze_batch,
+                    {"actions": [revised["actions"][0]]},
+                )
+                refreshed[0]["action_index"] = action_index
+                draft["batch_analysis"] = [
+                    refreshed[0] if item["action_index"] == action_index else item
+                    for item in draft["batch_analysis"]
+                ]
+                draft["operation"] = "universal_batch_review"
+                conversation["state"] = ConversationState.WAITING_FOR_CONFIRMATION
+                save_conversation(context, conversation)
+                await update.message.reply_text("Новое событие обновлено.")
+                await show_next_batch_conflict(update.message, context, conversation)
+                return
             if draft.get("operation") == "universal_plan_edit":
                 source = (
                     str(draft.get("extracted", ""))
@@ -668,18 +788,26 @@ async def process_user_text(update, context, user_text):
                     save_conversation(context, conversation)
                     await update.message.reply_text(plan["clarification_question"])
                     return
-                duplicates = await asyncio.to_thread(find_duplicate_actions, plan)
+                analysis = await asyncio.to_thread(analyze_batch, plan)
+                counts = batch_counts(analysis)
                 conversation["state"] = ConversationState.WAITING_FOR_CONFIRMATION
-                draft["operation"] = "universal_plan"
+                draft["operation"] = (
+                    "universal_batch_review" if counts["remaining"] else "universal_plan"
+                )
                 draft["plan"] = plan
-                draft["duplicate_indexes"] = [
-                    item["action_index"] for item in duplicates
-                ]
+                draft["batch_analysis"] = analysis
                 save_conversation(context, conversation)
                 await update.message.reply_text(
-                    "Обновила план:\n\n" + format_plan(plan),
-                    reply_markup=plan_keyboard(),
+                    "Обновила весь batch:\n\n"
+                    + format_batch_report(analysis)
+                    + "\n\n"
+                    + format_plan(plan),
+                    reply_markup=None if counts["remaining"] else plan_keyboard(),
                 )
+                if counts["remaining"]:
+                    await show_next_batch_conflict(
+                        update.message, context, conversation
+                    )
                 return
             reminder_candidates = draft.get("reminder_candidates", [])
             reminder_indexes = parse_candidate_selection(
@@ -737,17 +865,35 @@ async def process_user_text(update, context, user_text):
 
             if normalized_text in YES_ANSWERS:
                 if operation == "universal_plan":
-                    results = await asyncio.to_thread(
-                        execute_plan,
-                        draft["plan"],
-                        update.effective_user.id,
-                        reminder_store,
-                        draft.get("duplicate_indexes", []),
-                    )
+                    if draft.get("batch_analysis"):
+                        summary = await asyncio.to_thread(
+                            execute_batch,
+                            draft["plan"],
+                            draft["batch_analysis"],
+                            update.effective_user.id,
+                            reminder_store,
+                        )
+                    else:
+                        results = await asyncio.to_thread(
+                            execute_plan,
+                            draft["plan"],
+                            update.effective_user.id,
+                            reminder_store,
+                            draft.get("duplicate_indexes", []),
+                        )
+                        summary = {
+                            "created": sum(item["status"] == "done" for item in results),
+                            "skipped": sum(item["status"] == "skipped_duplicate" for item in results),
+                            "replaced": 0,
+                            "cancelled": 0,
+                        }
                     clear_conversation(context)
-                    done = sum(item["status"] == "done" for item in results)
                     await update.message.reply_text(
-                        f"Готово. Выполнено действий: {done}."
+                        "Готово. Итог batch:\n"
+                        f"Создано: {summary['created']}\n"
+                        f"Пропущено: {summary['skipped']}\n"
+                        f"Заменено: {summary['replaced']}\n"
+                        f"Отменено: {summary['cancelled']}"
                     )
                     return
                 if operation in {"delete_reminder", "delete_reminders"}:
