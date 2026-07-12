@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from services.calendar_service import (
@@ -86,6 +86,31 @@ def execute_plan(plan, user_id, reminder_store, skipped_indexes=None):
     return sorted(results, key=lambda item: item["index"])
 
 
+def summarize_plan_execution(plan, results):
+    details = []
+    for result in results:
+        skipped = result["status"] == "skipped_duplicate"
+        created_result = result.get("result") or {}
+        details.append({
+            "index": result["index"],
+            "status": "skipped" if skipped else "created",
+            "reason": (
+                "полный дубль уже есть в календаре" if skipped else "создано"
+            ),
+            "action": plan["actions"][result["index"]],
+            "calendar_event_ids": [created_result["id"]] if created_result.get("id") else [],
+        })
+    return {
+        "results": results,
+        "created": sum(item["status"] == "created" for item in details),
+        "skipped": sum(item["status"] == "skipped" for item in details),
+        "replaced": 0,
+        "cancelled": 0,
+        "details": details,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def execute_batch(plan, analysis, user_id, reminder_store):
     skipped = []
     replaced = 0
@@ -111,10 +136,47 @@ def execute_batch(plan, analysis, user_id, reminder_store):
         for item in results
     )
     skipped_count = sum(entry["decision"] == "skip" for entry in analysis)
+    result_by_index = {item["index"]: item for item in results}
+    details = []
+    for entry in analysis:
+        index = entry["action_index"]
+        decision = entry["decision"]
+        result = result_by_index.get(index, {})
+        if decision == "replace":
+            status = "replaced"
+            reason = "существующее событие заменено новым"
+        elif decision == "cancel":
+            status = "cancelled"
+            reason = "отменено пользователем"
+        elif decision == "skip":
+            status = "skipped"
+            reason = (
+                "полный дубль уже есть в календаре"
+                if entry["classification"] == "exact_duplicate"
+                else "оставлено существующее событие"
+            )
+        else:
+            status = "created" if result.get("status") == "done" else "cancelled"
+            reason = "создано" if status == "created" else "не выполнено"
+        created_result = result.get("result") or {}
+        details.append({
+            "index": index,
+            "status": status,
+            "reason": reason,
+            "action": plan["actions"][index],
+            "calendar_event_ids": [
+                value for value in (
+                    created_result.get("id"),
+                    *[event.get("id") for event in entry.get("existing", [])],
+                ) if value
+            ],
+        })
     return {
         "results": results,
         "created": created,
         "skipped": skipped_count,
         "replaced": replaced,
         "cancelled": cancelled,
+        "details": details,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
     }
