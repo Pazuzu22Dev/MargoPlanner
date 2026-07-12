@@ -398,6 +398,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "reply_to_message.photo=%s\nreply_to_message.document=%s\n"
         "external_reply=%r\nexternal_reply.photo=%s\n"
         "external_reply.document=%s\n"
+        "message.quote=%r\nquote_text=%r\n"
         "reply_text_length=%s\nmessage.forward_origin=%r\nsource_type=%s\n"
         "photo=%s document=%s voice=%s\nnormalized_input=%r",
         normalized.main_text,
@@ -412,6 +413,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         external_reply,
         bool(getattr(external_reply, "photo", None)),
         bool(getattr(external_reply, "document", None)),
+        getattr(update.message, "quote", None),
+        normalized.quote_text,
         len(normalized.reply_text),
         getattr(update.message, "forward_origin", None),
         normalized.source_type,
@@ -432,6 +435,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    inaccessible_reply = replied is not None and not any((
+        normalized.reply_text,
+        normalized.reply_caption,
+        normalized.quote_text,
+        normalized.attachment_message is not None,
+        external_reply,
+    ))
+    if inaccessible_reply:
+        await update.message.reply_text(
+            "Я вижу, что ты ответила на сообщение, но Telegram Bot API передал "
+            "мне только ссылку на него — без текста и изображения. Нажми на "
+            "исходном сообщении «Переслать» → MargoPlanner (не «Ответить») "
+            "или отправь его скриншотом/файлом — тогда я сразу прочитаю таблицу."
+        )
+        return
+
     vague_reference = user_text.casefold().strip(" ?!.,") in {
         "видишь", "видно", "добавь это", "обработай это", "а так",
     }
@@ -446,7 +465,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     structured = is_structured_telegram_text(normalized)
-    source_text = normalized.reply_text or normalized.main_text
+    source_text = normalized.reply_text or normalized.quote_text or normalized.main_text
     if structured:
         context.user_data["last_structured_input"] = normalized.combined_text
     markdown_schedule = is_markdown_table(source_text)
