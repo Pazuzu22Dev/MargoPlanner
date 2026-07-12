@@ -388,6 +388,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     normalized = normalize_telegram_message(update.message)
     replied = getattr(update.message, "reply_to_message", None)
+    external_reply = getattr(update.message, "external_reply", None)
     logger.info(
         "Telegram raw/normalized input:\n"
         "message.text=%r\nmessage.caption=%r\n"
@@ -395,6 +396,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "reply_to_message.entities=%r\nreply_to_message.caption_entities=%r\n"
         "reply_to_message.forward_origin=%r\n"
         "reply_to_message.photo=%s\nreply_to_message.document=%s\n"
+        "external_reply=%r\nexternal_reply.photo=%s\n"
+        "external_reply.document=%s\n"
         "reply_text_length=%s\nmessage.forward_origin=%r\nsource_type=%s\n"
         "photo=%s document=%s voice=%s\nnormalized_input=%r",
         normalized.main_text,
@@ -406,6 +409,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         getattr(replied, "forward_origin", None),
         bool(getattr(replied, "photo", None)),
         bool(getattr(replied, "document", None)),
+        external_reply,
+        bool(getattr(external_reply, "photo", None)),
+        bool(getattr(external_reply, "document", None)),
         len(normalized.reply_text),
         getattr(update.message, "forward_origin", None),
         normalized.source_type,
