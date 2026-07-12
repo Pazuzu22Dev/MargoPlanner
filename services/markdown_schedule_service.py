@@ -59,9 +59,10 @@ def _parse_date(text, now):
 
 
 def parse_markdown_shifts(text, employee="Марго", timezone_name="Europe/Podgorica"):
-    if not looks_like_schedule(text):
+    markdown_table = is_markdown_table(text)
+    if not markdown_table and not looks_like_schedule(text):
         return None
-    if not is_markdown_table(text):
+    if not markdown_table:
         return _parse_plain_schedule(text, employee, timezone_name)
     lines = [line.strip() for line in text.splitlines() if line.strip() and "|" in line]
     separator = next(
