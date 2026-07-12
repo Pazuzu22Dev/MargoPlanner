@@ -27,12 +27,61 @@ class NormalizedTelegramInput:
     attachment_message: object | None = None
 
 
+def _rich_text(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(_rich_text(item) for item in value)
+    if isinstance(value, dict):
+        return _rich_text(value.get("text", ""))
+    return str(value or "")
+
+
+def extract_rich_message_text(message):
+    rich_message = getattr(message, "rich_message", None)
+    if not rich_message:
+        rich_message = (getattr(message, "api_kwargs", None) or {}).get(
+            "rich_message"
+        )
+    if not isinstance(rich_message, dict):
+        return ""
+    output = []
+    for block in rich_message.get("blocks") or []:
+        block_type = block.get("type")
+        if block_type in {"paragraph", "heading"}:
+            text = _rich_text(block.get("text")).strip()
+            if text:
+                output.append(text)
+        elif block_type == "table":
+            rows = block.get("cells") or []
+            rendered_rows = []
+            for row in rows:
+                rendered_rows.append(
+                    "| " + " | ".join(
+                        _rich_text(cell.get("text", "")).strip()
+                        for cell in row
+                    ) + " |"
+                )
+            if rendered_rows:
+                column_count = len(rows[0])
+                rendered_rows.insert(
+                    1,
+                    "| " + " | ".join("---" for _ in range(column_count)) + " |",
+                )
+                output.append("\n".join(rendered_rows))
+    return "\n\n".join(output)
+
+
 def normalize_telegram_message(message):
     reply = getattr(message, "reply_to_message", None)
     external_reply = getattr(message, "external_reply", None)
     quote = getattr(message, "quote", None)
     quote_text = (getattr(quote, "text", None) or "").strip()
-    main_text = (getattr(message, "text", None) or "").strip()
+    main_text = (
+        getattr(message, "text", None)
+        or extract_rich_message_text(message)
+        or ""
+    ).strip()
     caption = (getattr(message, "caption", None) or "").strip()
     reply_text = (getattr(reply, "text", None) or "").strip() if reply else ""
     reply_caption = (
