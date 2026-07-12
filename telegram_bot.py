@@ -57,6 +57,7 @@ from services.batch_service import (
     batch_counts,
     format_batch_report,
     format_conflict,
+    format_duplicate,
     format_execution_report,
     find_retry_action,
 )
@@ -211,6 +212,16 @@ def batch_actions_keyboard():
 def conflict_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Оставить существующее", callback_data="batch:keep")],
+        [InlineKeyboardButton("🔁 Заменить новым", callback_data="batch:replace")],
+        [InlineKeyboardButton("➕ Оставить оба", callback_data="batch:both")],
+        [InlineKeyboardButton("✏️ Изменить новое", callback_data="batch:edit")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="batch:cancel")],
+    ])
+
+
+def duplicate_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("♻️ Пропустить дубль", callback_data="batch:keep")],
         [InlineKeyboardButton("🔁 Заменить новым", callback_data="batch:replace")],
         [InlineKeyboardButton("➕ Оставить оба", callback_data="batch:both")],
         [InlineKeyboardButton("✏️ Изменить новое", callback_data="batch:edit")],
@@ -587,8 +598,14 @@ async def present_universal_plan(update, context, plan, extracted, user_request=
         + "\n\nПолный план:\n\n"
         + format_plan(plan)
         + notes_text,
-        reply_markup=batch_actions_keyboard(),
+        reply_markup=None if counts["remaining"] else plan_keyboard(),
     )
+    if counts["remaining"]:
+        await show_next_batch_conflict(
+            update.effective_message,
+            context,
+            conversation,
+        )
 
 
 async def show_next_batch_conflict(message, context, conversation):
@@ -596,7 +613,8 @@ async def show_next_batch_conflict(message, context, conversation):
     analysis = draft["batch_analysis"]
     unresolved = [
         item for item in analysis
-        if item["classification"] == "conflict" and item["decision"] is None
+        if item["classification"] in {"conflict", "exact_duplicate"}
+        and item["decision"] is None
     ]
     if not unresolved:
         draft["operation"] = "universal_plan"
@@ -611,9 +629,17 @@ async def show_next_batch_conflict(message, context, conversation):
     draft["current_conflict_index"] = current["action_index"]
     save_conversation(context, conversation)
     await message.reply_text(
-        format_conflict(draft["plan"], current)
-        + f"\n\nОсталось разобрать конфликтов: {len(unresolved)}",
-        reply_markup=conflict_keyboard(),
+        (
+            format_duplicate(draft["plan"], current)
+            if current["classification"] == "exact_duplicate"
+            else format_conflict(draft["plan"], current)
+        )
+        + f"\n\nОсталось принять решений: {len(unresolved)}",
+        reply_markup=(
+            duplicate_keyboard()
+            if current["classification"] == "exact_duplicate"
+            else conflict_keyboard()
+        ),
     )
 
 
