@@ -16,6 +16,7 @@ class NormalizedTelegramInput:
     caption: str
     reply_text: str
     reply_caption: str
+    quote_text: str
     combined_text: str
     source_type: str
     is_forwarded: bool
@@ -29,6 +30,8 @@ class NormalizedTelegramInput:
 def normalize_telegram_message(message):
     reply = getattr(message, "reply_to_message", None)
     external_reply = getattr(message, "external_reply", None)
+    quote = getattr(message, "quote", None)
+    quote_text = (getattr(quote, "text", None) or "").strip()
     main_text = (getattr(message, "text", None) or "").strip()
     caption = (getattr(message, "caption", None) or "").strip()
     reply_text = (getattr(reply, "text", None) or "").strip() if reply else ""
@@ -43,7 +46,7 @@ def normalize_telegram_message(message):
         attachment_message = message
     if not get_message_attachment(attachment_message):
         attachment_message = None
-    context_text = reply_text or reply_caption
+    context_text = reply_text or reply_caption or quote_text
     current_text = main_text or caption
     if context_text:
         combined_text = (
@@ -59,6 +62,7 @@ def normalize_telegram_message(message):
         caption=caption,
         reply_text=reply_text,
         reply_caption=reply_caption,
+        quote_text=quote_text,
         combined_text=combined_text,
         source_type=detect_message_input(attachment_message or message),
         is_forwarded=bool(
@@ -73,11 +77,11 @@ def normalize_telegram_message(message):
 
 
 def is_structured_telegram_text(normalized):
-    text = normalized.reply_text or normalized.main_text
+    text = normalized.reply_text or normalized.quote_text or normalized.main_text
     nonempty_lines = [line for line in text.splitlines() if line.strip()]
     return bool(text) and (
         normalized.is_forwarded
-        or bool(normalized.reply_text)
+        or bool(normalized.reply_text or normalized.quote_text)
         or text.count("|") >= 4
         or len(nonempty_lines) >= 3
     )
