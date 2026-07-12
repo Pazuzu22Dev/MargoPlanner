@@ -70,6 +70,7 @@ from services.input_service import (
 )
 from services.input_dedup_service import InputDedupStore
 from services.markdown_schedule_service import (
+    is_markdown_table,
     looks_like_schedule,
     parse_markdown_shifts,
 )
@@ -386,20 +387,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorize_update(update):
         return
     normalized = normalize_telegram_message(update.message)
+    replied = getattr(update.message, "reply_to_message", None)
     logger.info(
-        "Telegram normalized input:\n"
-        "message.text=%r\ncaption=%r\nreply_to_message.text=%r\n"
-        "reply_to_message.caption=%r\nforwarded=%s\nsource_type=%s\n"
-        "photo=%s document=%s voice=%s",
-        normalized.main_text[:4000],
-        normalized.caption[:1000],
-        normalized.reply_text[:4000],
-        normalized.reply_caption[:1000],
-        normalized.is_forwarded,
+        "Telegram raw/normalized input:\n"
+        "message.text=%r\nmessage.caption=%r\n"
+        "reply_to_message.text=%r\nreply_to_message.caption=%r\n"
+        "reply_to_message.entities=%r\nreply_to_message.caption_entities=%r\n"
+        "reply_to_message.forward_origin=%r\n"
+        "reply_to_message.photo=%s\nreply_to_message.document=%s\n"
+        "reply_text_length=%s\nmessage.forward_origin=%r\nsource_type=%s\n"
+        "photo=%s document=%s voice=%s\nnormalized_input=%r",
+        normalized.main_text,
+        normalized.caption,
+        normalized.reply_text,
+        normalized.reply_caption,
+        getattr(replied, "entities", None),
+        getattr(replied, "caption_entities", None),
+        getattr(replied, "forward_origin", None),
+        bool(getattr(replied, "photo", None)),
+        bool(getattr(replied, "document", None)),
+        len(normalized.reply_text),
+        getattr(update.message, "forward_origin", None),
         normalized.source_type,
         normalized.has_photo,
         normalized.has_document,
         normalized.has_voice,
+        normalized.combined_text,
     )
     user_text = normalized.main_text or normalized.caption
     if not user_text:
@@ -430,7 +443,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     source_text = normalized.reply_text or normalized.main_text
     if structured:
         context.user_data["last_structured_input"] = normalized.combined_text
-    if structured and looks_like_schedule(source_text):
+    markdown_schedule = is_markdown_table(source_text)
+    if structured and (markdown_schedule or looks_like_schedule(source_text)):
         message_key = f"forwarded:{update.effective_chat.id}:{update.message.message_id}"
         if not await asyncio.to_thread(
             input_dedup_store.claim,
@@ -443,6 +457,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update.message.reply_text("🔎 Читаю таблицу и ищу смены Марго...")
         plan = await asyncio.to_thread(parse_markdown_shifts, source_text)
+        if plan is None:
+            await process_universal_payload(
+                update,
+                context,
+                InputPayload("forwarded_message", normalized.combined_text),
+                user_text,
+            )
+            return
+        if len(source_text) >= 4090:
+            plan.setdefault("notes", []).append(
+                "Telegram передал текст предельной длины. Возможно, конец "
+                "таблицы обрезан; проверь найденные строки перед подтверждением."
+            )
         await present_universal_plan(
             update,
             context,
@@ -468,8 +495,8 @@ async def process_universal_payload(update, context, payload, user_request=""):
     logger.info(
         "Planner input: source_type=%s request=%r extracted=%r",
         payload.source_type,
-        str(user_request)[:2000],
-        str(extracted)[:6000],
+        str(user_request),
+        str(extracted),
     )
     memories = await asyncio.to_thread(memory_store.as_prompt_context)
     plan = await asyncio.to_thread(
