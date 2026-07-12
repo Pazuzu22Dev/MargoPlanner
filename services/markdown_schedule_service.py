@@ -27,6 +27,16 @@ def is_markdown_table(text):
     )
 
 
+def looks_like_schedule(text):
+    normalized = text.casefold()
+    return (
+        "марго" in normalized
+        and bool(TIME_RANGE.search(text))
+        and bool(NUMERIC_DATE.search(text) or TEXT_DATE.search(text))
+        and any(word in normalized for word in ("смен", "день", "дата"))
+    )
+
+
 def _cells(line):
     return [cell.strip() for cell in line.strip().strip("|").split("|")]
 
@@ -49,8 +59,10 @@ def _parse_date(text, now):
 
 
 def parse_markdown_shifts(text, employee="Марго", timezone_name="Europe/Podgorica"):
-    if not is_markdown_table(text):
+    if not looks_like_schedule(text):
         return None
+    if not is_markdown_table(text):
+        return _parse_plain_schedule(text, employee, timezone_name)
     lines = [line.strip() for line in text.splitlines() if line.strip() and "|" in line]
     separator = next(
         index for index, line in enumerate(lines)
@@ -117,3 +129,59 @@ def parse_markdown_shifts(text, employee="Марго", timezone_name="Europe/Pod
             "notes": notes,
         }
     return {"actions": actions, "clarification_question": "", "notes": notes}
+
+
+def _parse_plain_schedule(text, employee, timezone_name):
+    ranges = [
+        (
+            match.group("start").replace(".", ":"),
+            match.group("end").replace(".", ":"),
+        )
+        for match in TIME_RANGE.finditer(text)
+    ]
+    # The rendered Telegram table used by Valera currently has one shift
+    # interval in its header. Multiple intervals require preserved columns.
+    unique_ranges = list(dict.fromkeys(ranges))
+    if len(unique_ranges) != 1:
+        return {
+            "actions": [],
+            "clarification_question": (
+                "Я вижу несколько интервалов смен, но Telegram не сохранил "
+                "границы столбцов. Перешли таблицу как Markdown-текст или файл."
+            ),
+            "notes": [],
+        }
+    start_text, end_text = unique_ranges[0]
+    timezone = ZoneInfo(timezone_name)
+    now = datetime.now(timezone)
+    actions = []
+    for row_number, line in enumerate(text.splitlines(), start=1):
+        row_date = _parse_date(line, now)
+        if not row_date or employee.casefold() not in line.casefold():
+            continue
+        if "выходной" in line.casefold():
+            continue
+        start_hour, start_minute = map(int, start_text.split(":"))
+        end_hour, end_minute = map(int, end_text.split(":"))
+        start = row_date.replace(hour=start_hour, minute=start_minute, tzinfo=timezone)
+        end = row_date.replace(hour=end_hour, minute=end_minute, tzinfo=timezone)
+        if end <= start:
+            end += timedelta(days=1)
+        actions.append({
+            "action": "create_calendar_event",
+            "data": {
+                "title": "Рабочая смена",
+                "employee": employee,
+                "row_type": "Смена",
+                "source_row": row_number,
+                "start_time": start.isoformat(),
+                "end_time": end.isoformat(),
+            },
+        })
+    if not actions:
+        return {
+            "actions": [],
+            "clarification_question": "Я вижу расписание, но не смогла выделить строки Марго.",
+            "notes": [],
+        }
+    return {"actions": actions, "clarification_question": "", "notes": []}
