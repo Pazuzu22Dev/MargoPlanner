@@ -45,6 +45,14 @@ from services.intent_service import detect_intent
 from services.memory_service import MemoryStore
 from services.voice_service import VoiceQuotaError, transcribe_voice
 from services.reminder_service import ReminderStore
+from services.action_executor import (
+    execute_plan,
+    find_duplicate_actions,
+    format_plan,
+)
+from services.extraction_service import extract_content
+from services.input_service import InputPayload, detect_message_input
+from services.planner_service import build_plan
 
 
 load_dotenv()
@@ -147,6 +155,14 @@ def reminder_actions_keyboard():
         [InlineKeyboardButton("➕ Добавить", callback_data="reminders:add")],
         [InlineKeyboardButton("🗑 Удалить", callback_data="reminders:delete")],
         [InlineKeyboardButton("🧹 Очистить все", callback_data="reminders:clear")],
+    ])
+
+
+def plan_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Выполнить всё", callback_data="plan:execute")],
+        [InlineKeyboardButton("✏️ Исправить", callback_data="plan:edit")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
     ])
 
 
@@ -322,7 +338,87 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     if not user_text:
         return
+    if detect_message_input(update.message) == "forwarded_message":
+        await process_universal_payload(
+            update,
+            context,
+            InputPayload("forwarded_message", user_text),
+            user_text,
+        )
+        return
     await process_user_text(update, context, user_text)
+
+
+async def process_universal_payload(update, context, payload, user_request=""):
+    await update.effective_message.reply_text("🔎 Читаю и составляю план...")
+    extracted = await asyncio.to_thread(extract_content, payload)
+    memories = await asyncio.to_thread(memory_store.as_prompt_context)
+    plan = await asyncio.to_thread(
+        build_plan,
+        extracted,
+        user_request or payload.caption,
+        memories,
+    )
+    if plan["clarification_question"]:
+        conversation = new_conversation(user_request or payload.caption or "Импорт")
+        conversation["state"] = ConversationState.WAITING_FOR_CLARIFICATION
+        conversation["draft"] = {
+            "operation": "universal_plan_edit",
+            "plan": plan,
+            "extracted": extracted if isinstance(extracted, str) else "Изображение",
+        }
+        save_conversation(context, conversation)
+        await update.effective_message.reply_text(plan["clarification_question"])
+        return
+    duplicates = await asyncio.to_thread(find_duplicate_actions, plan)
+    skipped = [item["action_index"] for item in duplicates]
+    conversation = new_conversation(user_request or payload.caption or "Импорт")
+    conversation["state"] = ConversationState.WAITING_FOR_CONFIRMATION
+    conversation["draft"] = {
+        "operation": "universal_plan",
+        "plan": plan,
+        "duplicate_indexes": skipped,
+        "extracted": extracted if isinstance(extracted, str) else "Изображение",
+    }
+    save_conversation(context, conversation)
+    duplicate_text = (
+        f"\n\n⚠️ Возможных дубликатов: {len(skipped)}. Я пропущу их."
+        if skipped else ""
+    )
+    await update.effective_message.reply_text(
+        "Я подготовила план:\n\n" + format_plan(plan) + duplicate_text,
+        reply_markup=plan_keyboard(),
+    )
+
+
+async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorize_update(update):
+        return
+    message = update.effective_message
+    source_type = detect_message_input(message)
+    if source_type == "document":
+        await message.reply_text(
+            "Пока я читаю изображения, PDF, CSV и XLSX. Этот формат не поддерживается."
+        )
+        return
+    if source_type == "image" and message.photo:
+        telegram_file = await context.bot.get_file(message.photo[-1].file_id)
+        filename = "image.jpg"
+        mime_type = "image/jpeg"
+    else:
+        document = message.document
+        telegram_file = await context.bot.get_file(document.file_id)
+        filename = document.file_name or "document"
+        mime_type = document.mime_type or "application/octet-stream"
+    content = bytes(await telegram_file.download_as_bytearray())
+    payload = InputPayload(
+        source_type=source_type,
+        content=content,
+        filename=filename,
+        mime_type=mime_type,
+        caption=message.caption or "",
+    )
+    await process_universal_payload(update, context, payload, message.caption or "")
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -387,6 +483,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     conversation = get_conversation(context)
+    if data == "plan:execute":
+        if not conversation or conversation.get("draft", {}).get("operation") != "universal_plan":
+            await query.message.reply_text("Этот план уже неактуален.")
+            return
+        draft = conversation["draft"]
+        results = await asyncio.to_thread(
+            execute_plan,
+            draft["plan"],
+            update.effective_user.id,
+            reminder_store,
+            draft.get("duplicate_indexes", []),
+        )
+        done = sum(item["status"] == "done" for item in results)
+        skipped = sum(item["status"] == "skipped_duplicate" for item in results)
+        clear_conversation(context)
+        await query.message.reply_text(
+            f"Готово. Выполнено действий: {done}."
+            + (f" Дубликатов пропущено: {skipped}." if skipped else "")
+        )
+        return
+    if data == "plan:edit":
+        if not conversation or conversation.get("draft", {}).get("operation") != "universal_plan":
+            await query.message.reply_text("Этот план уже неактуален.")
+            return
+        conversation["state"] = ConversationState.WAITING_FOR_CLARIFICATION
+        conversation["draft"]["operation"] = "universal_plan_edit"
+        save_conversation(context, conversation)
+        await query.message.reply_text("Что исправить в плане? Напиши своими словами.")
+        return
     if data == "reminders:add":
         clear_conversation(context)
         await query.message.reply_text(
@@ -490,6 +615,37 @@ async def process_user_text(update, context, user_text):
 
         if state == ConversationState.WAITING_FOR_CLARIFICATION:
             draft = conversation.get("draft", {})
+            if draft.get("operation") == "universal_plan_edit":
+                source = (
+                    str(draft.get("extracted", ""))
+                    + "\n\nТекущий план:\n"
+                    + str(draft.get("plan", {}))
+                )
+                memories = await asyncio.to_thread(memory_store.as_prompt_context)
+                plan = await asyncio.to_thread(
+                    build_plan,
+                    source,
+                    "Исправление пользователя: " + user_text,
+                    memories,
+                )
+                if plan["clarification_question"]:
+                    draft["plan"] = plan
+                    save_conversation(context, conversation)
+                    await update.message.reply_text(plan["clarification_question"])
+                    return
+                duplicates = await asyncio.to_thread(find_duplicate_actions, plan)
+                conversation["state"] = ConversationState.WAITING_FOR_CONFIRMATION
+                draft["operation"] = "universal_plan"
+                draft["plan"] = plan
+                draft["duplicate_indexes"] = [
+                    item["action_index"] for item in duplicates
+                ]
+                save_conversation(context, conversation)
+                await update.message.reply_text(
+                    "Обновила план:\n\n" + format_plan(plan),
+                    reply_markup=plan_keyboard(),
+                )
+                return
             reminder_candidates = draft.get("reminder_candidates", [])
             reminder_indexes = parse_candidate_selection(
                 user_text,
@@ -545,6 +701,20 @@ async def process_user_text(update, context, user_text):
             events = draft.get("events", [])
 
             if normalized_text in YES_ANSWERS:
+                if operation == "universal_plan":
+                    results = await asyncio.to_thread(
+                        execute_plan,
+                        draft["plan"],
+                        update.effective_user.id,
+                        reminder_store,
+                        draft.get("duplicate_indexes", []),
+                    )
+                    clear_conversation(context)
+                    done = sum(item["status"] == "done" for item in results)
+                    await update.message.reply_text(
+                        f"Готово. Выполнено действий: {done}."
+                    )
+                    return
                 if operation in {"delete_reminder", "delete_reminders"}:
                     targets = draft["reminder_targets"]
                     deleted = await asyncio.to_thread(
@@ -998,6 +1168,9 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(
+        MessageHandler(filters.PHOTO | filters.Document.ALL, handle_attachment)
+    )
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
