@@ -22,18 +22,25 @@ class NormalizedTelegramInput:
     has_photo: bool
     has_document: bool
     has_voice: bool
+    has_external_reply: bool
     attachment_message: object | None = None
 
 
 def normalize_telegram_message(message):
     reply = getattr(message, "reply_to_message", None)
+    external_reply = getattr(message, "external_reply", None)
     main_text = (getattr(message, "text", None) or "").strip()
     caption = (getattr(message, "caption", None) or "").strip()
     reply_text = (getattr(reply, "text", None) or "").strip() if reply else ""
     reply_caption = (
         (getattr(reply, "caption", None) or "").strip() if reply else ""
     )
-    attachment_message = reply if reply and get_message_attachment(reply) else message
+    if reply and get_message_attachment(reply):
+        attachment_message = reply
+    elif external_reply and get_message_attachment(external_reply):
+        attachment_message = external_reply
+    else:
+        attachment_message = message
     if not get_message_attachment(attachment_message):
         attachment_message = None
     context_text = reply_text or reply_caption
@@ -54,10 +61,13 @@ def normalize_telegram_message(message):
         reply_caption=reply_caption,
         combined_text=combined_text,
         source_type=detect_message_input(attachment_message or message),
-        is_forwarded=bool(getattr(message, "forward_origin", None)),
+        is_forwarded=bool(
+            getattr(message, "forward_origin", None) or external_reply
+        ),
         has_photo=bool(getattr(attachment_message or message, "photo", None)),
         has_document=bool(getattr(attachment_message or message, "document", None)),
         has_voice=bool(getattr(attachment_message or message, "voice", None)),
+        has_external_reply=bool(external_reply),
         attachment_message=attachment_message,
     )
 
