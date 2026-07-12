@@ -87,6 +87,12 @@ def build_plan(extracted, user_request="", memories=""):
 Запрос пользователя: {user_request or 'Определи полезные действия из содержимого'}
 Память: {memories or '[]'}
 
+Содержимое ниже уже непосредственно получено из Telegram-сообщения пользователя.
+Не проси доступ к таблице, локальному файлу или ссылке и не проси копировать данные,
+если текст или изображение присутствуют в «Содержимое». Анализируй переданные данные.
+Если текст действительно неполный, перечисли, какую часть удалось прочитать, и
+задай конкретный вопрос только о недостающих значениях.
+
 Верни строго JSON:
 {{"actions":[{{"action":"create_calendar_event | update_calendar_event | delete_calendar_event | create_reminder | update_reminder | delete_reminder","data":{{}}}}],"clarification_question":"","notes":[]}}
 
