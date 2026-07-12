@@ -4,13 +4,15 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -114,6 +116,38 @@ def format_reminder_list(reminders):
         )
         lines.append(f"{number}. {remind_at.strftime('%H:%M')} — {reminder['text']}")
     return "\n".join(lines)
+
+
+def confirmation_keyboard():
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ Да", callback_data="confirm:yes"),
+            InlineKeyboardButton("❌ Нет", callback_data="confirm:no"),
+        ]]
+    )
+
+
+def selection_keyboard(items, kind, destructive=True):
+    icon = "🗑" if destructive else "👉"
+    rows = []
+    for index, item in enumerate(items):
+        title = item.get("title") or item.get("text") or "Без названия"
+        rows.append([
+            InlineKeyboardButton(
+                f"{icon} {title[:48]}",
+                callback_data=f"select:{kind}:{index}",
+            )
+        ])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def reminder_actions_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Добавить", callback_data="reminders:add")],
+        [InlineKeyboardButton("🗑 Удалить", callback_data="reminders:delete")],
+        [InlineKeyboardButton("🧹 Очистить все", callback_data="reminders:clear")],
+    ])
 
 
 async def reminder_dispatcher(application):
@@ -329,6 +363,89 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_user_text(update, context, transcript)
 
 
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if ALLOWED_USER_ID is not None and update.effective_user.id != ALLOWED_USER_ID:
+        return
+    data = query.data or ""
+    proxy = SimpleNamespace(
+        message=query.message,
+        effective_message=query.message,
+        effective_user=update.effective_user,
+    )
+
+    if data == "confirm:yes":
+        await process_user_text(proxy, context, "да")
+        return
+    if data == "confirm:no":
+        await process_user_text(proxy, context, "нет")
+        return
+    if data == "cancel":
+        clear_conversation(context)
+        await query.message.reply_text("Хорошо, отменила.")
+        return
+
+    conversation = get_conversation(context)
+    if data == "reminders:add":
+        clear_conversation(context)
+        await query.message.reply_text(
+            "Что тебе напомнить и когда? Напиши как обычно, своими словами."
+        )
+        return
+    if not conversation:
+        await query.message.reply_text(
+            "Этот список уже неактуален. Попроси меня показать его ещё раз."
+        )
+        return
+
+    draft = conversation.get("draft", {})
+    reminder_candidates = draft.get("reminder_candidates", [])
+    if data == "reminders:delete":
+        if not reminder_candidates:
+            await query.message.reply_text("Активных напоминаний уже нет.")
+            return
+        conversation["state"] = ConversationState.WAITING_FOR_CLARIFICATION
+        draft["operation"] = "delete_reminder"
+        save_conversation(context, conversation)
+        await query.message.reply_text(
+            "Какое напоминание удалить?",
+            reply_markup=selection_keyboard(reminder_candidates, "reminder"),
+        )
+        return
+    if data == "reminders:clear":
+        if not reminder_candidates:
+            await query.message.reply_text("Активных напоминаний уже нет.")
+            return
+        conversation["state"] = ConversationState.WAITING_FOR_CONFIRMATION
+        conversation["draft"] = {
+            "operation": "delete_reminders",
+            "events": [],
+            "reminder_targets": reminder_candidates,
+        }
+        save_conversation(context, conversation)
+        await query.message.reply_text(
+            "Удалить все показанные напоминания?\n\n"
+            + format_reminder_list(reminder_candidates),
+            reply_markup=confirmation_keyboard(),
+        )
+        return
+    if data.startswith("select:"):
+        parts = data.split(":")
+        if len(parts) != 3 or not parts[2].isdigit():
+            return
+        index = int(parts[2])
+        candidates = (
+            reminder_candidates
+            if parts[1] == "reminder"
+            else draft.get("candidates", [])
+        )
+        if index >= len(candidates):
+            await query.message.reply_text("Этот вариант уже неактуален.")
+            return
+        await process_user_text(proxy, context, str(index + 1))
+
+
 async def process_user_text(update, context, user_text):
     normalized_text = user_text.lower()
 
@@ -347,7 +464,8 @@ async def process_user_text(update, context, user_text):
         save_conversation(context, conversation)
         await update.message.reply_text(
             format_undo_action(action)
-            + "\n\nОтменить это действие? Ответьте «да» или «нет»."
+            + "\n\nОтменить это действие?",
+            reply_markup=confirmation_keyboard(),
         )
         return
 
@@ -391,7 +509,8 @@ async def process_user_text(update, context, user_text):
                 await update.message.reply_text(
                     "Удалить напоминания:\n\n"
                     + format_reminder_list(targets)
-                    + "\n\nПодтвердить? Ответьте «да» или «нет»."
+                    + "\n\nПодтвердить?",
+                    reply_markup=confirmation_keyboard(),
                 )
                 return
             candidates = draft.get("candidates", [])
@@ -415,7 +534,8 @@ async def process_user_text(update, context, user_text):
                 await update.message.reply_text(
                     "Удалить события:\n\n"
                     + format_events(targets)
-                    + "\n\nПодтвердить? Ответьте «да» или «нет»."
+                    + "\n\nПодтвердить?",
+                    reply_markup=confirmation_keyboard(),
                 )
                 return
 
@@ -472,7 +592,8 @@ async def process_user_text(update, context, user_text):
                         save_conversation(context, conversation)
                         await update.message.reply_text(
                             "Одно из событий изменилось после моего предложения. "
-                            "Я обновила список — подтвердите удаление ещё раз."
+                            "Я обновила список — подтвердите удаление ещё раз.",
+                            reply_markup=confirmation_keyboard(),
                         )
                         return
                 else:
@@ -487,7 +608,8 @@ async def process_user_text(update, context, user_text):
                         await update.message.reply_text(
                             "Событие изменилось в календаре после моего "
                             "предложения. Я обновила данные — подтвердите "
-                            "действие ещё раз."
+                            "действие ещё раз.",
+                            reply_markup=confirmation_keyboard(),
                         )
                         return
 
@@ -651,7 +773,8 @@ async def process_user_text(update, context, user_text):
             "Я поняла так:\n\n"
             + format_events(events)
             + ("\n\n" + warning if warning else "")
-            + "\n\nСоздать? Ответьте «да» или «нет»."
+            + "\n\nСоздать?",
+            reply_markup=confirmation_keyboard(),
         )
         return
 
@@ -662,7 +785,8 @@ async def process_user_text(update, context, user_text):
         await update.message.reply_text(
             "Поставить напоминание в Telegram:\n\n"
             + format_reminder(reminder)
-            + "\n\nПодтвердить? Ответьте «да» или «нет»."
+            + "\n\nПодтвердить?",
+            reply_markup=confirmation_keyboard(),
         )
         return
 
@@ -684,7 +808,8 @@ async def process_user_text(update, context, user_text):
             save_conversation(context, conversation)
             await update.message.reply_text(
                 "Вот твои активные напоминания:\n\n"
-                + format_reminder_list(reminders)
+                + format_reminder_list(reminders),
+                reply_markup=reminder_actions_keyboard(),
             )
         else:
             clear_conversation(context)
@@ -718,7 +843,8 @@ async def process_user_text(update, context, user_text):
             await update.message.reply_text(
                 "Нашла несколько напоминаний:\n\n"
                 + format_reminder_list(targets)
-                + "\n\nКакое удалить? Напиши номер."
+                + "\n\nКакое удалить?",
+                reply_markup=selection_keyboard(targets, "reminder"),
             )
             return
         conversation["state"] = ConversationState.WAITING_FOR_CONFIRMATION
@@ -731,7 +857,8 @@ async def process_user_text(update, context, user_text):
         await update.message.reply_text(
             "Удалить напоминания:\n\n"
             + format_reminder_list(targets)
-            + "\n\nПодтвердить? Ответьте «да» или «нет»."
+            + "\n\nПодтвердить?",
+            reply_markup=confirmation_keyboard(),
         )
         return
 
@@ -769,8 +896,12 @@ async def process_user_text(update, context, user_text):
                 await update.message.reply_text(
                     "Нашла несколько вариантов:\n\n"
                     + format_candidates(candidates)
-                    + "\n\nКакие удалить? Можно ответить «все», «1 и 2» "
-                    "или указать один номер."
+                    + "\n\nВыбери нужное событие:",
+                    reply_markup=selection_keyboard(
+                        candidates,
+                        "event",
+                        destructive=action != "update_event",
+                    ),
                 )
                 return
             if action == "delete_events":
@@ -782,7 +913,8 @@ async def process_user_text(update, context, user_text):
                 await update.message.reply_text(
                     "Удалить все найденные события:\n\n"
                     + format_events(candidates)
-                    + "\n\nПодтвердить? Ответьте «да» или «нет»."
+                    + "\n\nПодтвердить?",
+                    reply_markup=confirmation_keyboard(),
                 )
                 return
             target = candidates[0]
@@ -812,7 +944,8 @@ async def process_user_text(update, context, user_text):
 
         save_conversation(context, conversation)
         await update.message.reply_text(
-            preview + "\n\nПодтвердить? Ответьте «да» или «нет»."
+            preview + "\n\nПодтвердить?",
+            reply_markup=confirmation_keyboard(),
         )
         return
 
@@ -864,6 +997,7 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
