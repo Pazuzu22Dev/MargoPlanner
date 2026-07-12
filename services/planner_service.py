@@ -26,6 +26,7 @@ def validate_plan(raw):
     if not isinstance(actions, list):
         raise ValueError("actions должен быть списком")
     normalized = []
+    seen_events = set()
     for item in actions:
         if not isinstance(item, dict) or item.get("action") not in STANDARD_ACTIONS:
             raise ValueError("План содержит запрещённое действие")
@@ -41,6 +42,17 @@ def validate_plan(raw):
             end = datetime.fromisoformat(data["end_time"])
             if start.tzinfo is None or end.tzinfo is None or end <= start:
                 raise ValueError("Некорректное время события")
+            if str(data.get("row_type", "")).strip().casefold() in {
+                "выходной", "off", "day off",
+            }:
+                continue
+            employee = str(data.get("employee", "")).strip()
+            if employee and "марго" not in employee.casefold():
+                continue
+            key = (data.get("title"), start.isoformat(), end.isoformat())
+            if action == "create_calendar_event" and key in seen_events:
+                continue
+            seen_events.add(key)
         if action in {"create_reminder", "update_reminder"}:
             if not data.get("text") or not data.get("remind_at"):
                 raise ValueError("У напоминания нужны текст и время")
@@ -52,8 +64,20 @@ def validate_plan(raw):
             raise ValueError("Для удаления нужен id")
         normalized.append({"action": action, "data": data})
     if not normalized and not question:
-        raise ValueError("Пустой план")
-    return {"actions": normalized, "clarification_question": question, "notes": raw.get("notes", [])}
+        question = (
+            "Я не нашла подходящих действий или строк Марго. "
+            "Уточни запрос или пришли более чёткий файл."
+        )
+    notes = raw.get("notes") or []
+    if isinstance(notes, str):
+        notes = [notes]
+    if not isinstance(notes, list):
+        notes = [str(notes)]
+    return {
+        "actions": normalized,
+        "clarification_question": question,
+        "notes": [str(note).strip() for note in notes if str(note).strip()],
+    }
 
 
 def build_plan(extracted, user_request="", memories=""):
@@ -68,8 +92,11 @@ def build_plan(extracted, user_request="", memories=""):
 
 Разрешены только перечисленные actions. Ничего не выполняй. Если данных недостаточно — actions оставь пустым и задай один вопрос.
 Для create_calendar_event обязательны title, start_time, end_time; дополнительно description, location, links, contacts, attendees.
-Для смен из таблицы самостоятельно найди колонки сотрудника, даты, начала и окончания, выбери только строки Марго и назови события «Рабочая смена».
-Не создавай действия для других сотрудников. Все даты верни ISO 8601 с часовым поясом.
+Для смен из таблицы самостоятельно найди колонки сотрудника, даты, начала и окончания. Выбери только строки, где сотрудник — Марго, и назови события «Рабочая смена».
+В data каждой смены обязательно добавь employee с именем из исходной строки и row_type с типом строки.
+Не включай других сотрудников и строки «Выходной». Не угадывай конец смены: если хотя бы у одной смены Марго не виден конец, верни пустой actions и clarification_question.
+Если изображение обрезано и видна не вся таблица, добавь понятное предупреждение в notes. В notes также сообщи о сомнительных или плохо читаемых строках.
+Проверь каждую видимую строку Марго по отдельности и не повторяй одинаковые смены. Все даты верни ISO 8601 с часовым поясом.
 Содержимое:
 """
     contents = [prompt]
@@ -83,4 +110,26 @@ def build_plan(extracted, user_request="", memories=""):
         contents=contents,
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
-    return validate_plan(json.loads(response.text))
+    raw = json.loads(response.text)
+    for item in raw.get("actions") or []:
+        if item.get("action") in {"create_calendar_event", "update_calendar_event"}:
+            data = item.get("data") or {}
+            if not data.get("end_time"):
+                return {
+                    "actions": [],
+                    "clarification_question": (
+                        "Я вижу смену без времени окончания. Подскажи, "
+                        "во сколько она заканчивается?"
+                    ),
+                    "notes": raw.get("notes", []),
+                }
+            if "смен" in str(data.get("title", "")).casefold() and not data.get("employee"):
+                return {
+                    "actions": [],
+                    "clarification_question": (
+                        "Я не смогла уверенно прочитать имя сотрудника в одной "
+                        "из строк. Пришли, пожалуйста, более чёткий или полный снимок."
+                    ),
+                    "notes": raw.get("notes", []),
+                }
+    return validate_plan(raw)
