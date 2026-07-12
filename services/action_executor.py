@@ -1,3 +1,4 @@
+from datetime import datetime
 from uuid import uuid4
 
 from services.calendar_service import (
@@ -6,6 +7,7 @@ from services.calendar_service import (
     search_events,
     update_event,
 )
+from services.action_formatter import format_plan
 
 
 def _event_from_data(data):
@@ -35,8 +37,10 @@ def find_duplicate_actions(plan):
         exact = [
             event for event in candidates
             if event["title"].casefold() == data["title"].casefold()
-            and event["start_time"] == data["start_time"]
-            and event["end_time"] == data["end_time"]
+            and datetime.fromisoformat(event["start_time"])
+            == datetime.fromisoformat(data["start_time"])
+            and datetime.fromisoformat(event["end_time"])
+            == datetime.fromisoformat(data["end_time"])
         ]
         if exact:
             duplicates.append({"action_index": index, "events": exact})
@@ -80,21 +84,3 @@ def execute_plan(plan, user_id, reminder_store, skipped_indexes=None):
         for (index, _), result in zip(calendar_creates, created):
             results.append({"index": index, "status": "done", "result": result})
     return sorted(results, key=lambda item: item["index"])
-
-
-def format_plan(plan):
-    labels = {
-        "create_calendar_event": "📅 Создать событие",
-        "update_calendar_event": "✏️ Изменить событие",
-        "delete_calendar_event": "🗑 Удалить событие",
-        "create_reminder": "🔔 Создать напоминание",
-        "update_reminder": "✏️ Изменить напоминание",
-        "delete_reminder": "🗑 Удалить напоминание",
-    }
-    lines = []
-    for number, item in enumerate(plan["actions"], start=1):
-        data = item["data"]
-        title = data.get("title") or data.get("text") or str(data.get("id", ""))
-        when = data.get("start_time") or data.get("remind_at") or ""
-        lines.append(f"{number}. {labels[item['action']]}: {title}" + (f"\n   {when}" if when else ""))
-    return "\n".join(lines)
