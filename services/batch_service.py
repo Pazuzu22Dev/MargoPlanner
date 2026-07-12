@@ -1,12 +1,24 @@
+import re
 from datetime import datetime
+from difflib import SequenceMatcher
 
 from services.action_formatter import format_calendar_action
 from services.calendar_service import search_events
 
 
+def _normalized_title(value):
+    return " ".join(re.sub(r"[^\w\s]", " ", value.casefold()).split())
+
+
 def _same_event(existing, new):
+    existing_title = _normalized_title(existing["title"])
+    new_title = _normalized_title(new["title"])
+    titles_match = (
+        existing_title == new_title
+        or SequenceMatcher(None, existing_title, new_title).ratio() >= 0.88
+    )
     return (
-        existing["title"].casefold() == new["title"].casefold()
+        titles_match
         and datetime.fromisoformat(existing["start_time"])
         == datetime.fromisoformat(new["start_time"])
         and datetime.fromisoformat(existing["end_time"])
@@ -121,3 +133,34 @@ def batch_followup_response(user_text, summary):
     if status is None:
         return None
     return format_execution_report(summary, (status,))
+
+
+def find_retry_action(user_text, summary):
+    normalized = user_text.casefold().replace("ё", "е")
+    if not any(word in normalized for word in ("создай", "добавь", "поставь")):
+        return None
+    number_match = re.search(r"\b(\d+)\b", normalized)
+    number = int(number_match.group(1)) if number_match else None
+    if number is None:
+        ordinals = {
+            "перв": 1,
+            "втор": 2,
+            "трет": 3,
+            "четверт": 4,
+            "пят": 5,
+            "шест": 6,
+            "седьм": 7,
+            "восьм": 8,
+            "девят": 9,
+            "десят": 10,
+        }
+        number = next(
+            (value for stem, value in ordinals.items() if stem in normalized),
+            None,
+        )
+    if number is None:
+        return None
+    for detail in summary.get("details", []):
+        if detail.get("index") == number - 1:
+            return detail.get("action")
+    return None
