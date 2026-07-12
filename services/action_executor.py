@@ -84,3 +84,37 @@ def execute_plan(plan, user_id, reminder_store, skipped_indexes=None):
         for (index, _), result in zip(calendar_creates, created):
             results.append({"index": index, "status": "done", "result": result})
     return sorted(results, key=lambda item: item["index"])
+
+
+def execute_batch(plan, analysis, user_id, reminder_store):
+    skipped = []
+    replaced = 0
+    cancelled = 0
+    for entry in analysis:
+        decision = entry["decision"]
+        index = entry["action_index"]
+        if decision in {"skip", "cancel"}:
+            skipped.append(index)
+            cancelled += decision == "cancel"
+        elif decision == "replace":
+            new_data = _event_from_data(plan["actions"][index]["data"])
+            existing = entry["existing"]
+            update_event(existing[0]["id"], new_data)
+            if len(existing) > 1:
+                delete_events([event["id"] for event in existing[1:]])
+            skipped.append(index)
+            replaced += 1
+    results = execute_plan(plan, user_id, reminder_store, skipped)
+    created = sum(
+        item["status"] == "done"
+        and plan["actions"][item["index"]]["action"] == "create_calendar_event"
+        for item in results
+    )
+    skipped_count = sum(entry["decision"] == "skip" for entry in analysis)
+    return {
+        "results": results,
+        "created": created,
+        "skipped": skipped_count,
+        "replaced": replaced,
+        "cancelled": cancelled,
+    }
