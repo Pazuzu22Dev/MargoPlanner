@@ -65,6 +65,8 @@ from services.input_service import (
     InputPayload,
     detect_message_input,
     get_message_attachment,
+    is_structured_telegram_text,
+    normalize_telegram_message,
 )
 from services.input_dedup_service import InputDedupStore
 from services.markdown_schedule_service import (
@@ -383,66 +385,92 @@ def undo_calendar_action(action):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorize_update(update):
         return
-    user_text = update.message.text.strip()
+    normalized = normalize_telegram_message(update.message)
+    logger.info(
+        "Telegram normalized input:\n"
+        "message.text=%r\ncaption=%r\nreply_to_message.text=%r\n"
+        "reply_to_message.caption=%r\nforwarded=%s\nsource_type=%s\n"
+        "photo=%s document=%s voice=%s",
+        normalized.main_text[:4000],
+        normalized.caption[:1000],
+        normalized.reply_text[:4000],
+        normalized.reply_caption[:1000],
+        normalized.is_forwarded,
+        normalized.source_type,
+        normalized.has_photo,
+        normalized.has_document,
+        normalized.has_voice,
+    )
+    user_text = normalized.main_text or normalized.caption
     if not user_text:
         return
-    replied = getattr(update.message, "reply_to_message", None)
-    if replied:
-        attachment = get_message_attachment(replied)
-        if attachment:
-            await process_message_attachment(
-                update,
-                context,
-                replied,
-                user_text,
-            )
-            return
-        replied_text = (
-            getattr(replied, "text", None)
-            or getattr(replied, "caption", None)
-            or ""
-        ).strip()
-        if replied_text:
-            if looks_like_schedule(replied_text):
-                await update.message.reply_text(
-                    "🔎 Читаю таблицу из сообщения, на которое ты ответила..."
-                )
-                plan = await asyncio.to_thread(parse_markdown_shifts, replied_text)
-                await present_universal_plan(
-                    update,
-                    context,
-                    plan,
-                    replied_text,
-                    user_text,
-                )
-                return
-            user_text = (
-                "Пользователь отвечает на сообщение:\n\n"
-                + replied_text
-                + "\n\nНовое сообщение пользователя:\n\n"
-                + user_text
-            )
-    if looks_like_schedule(user_text):
+    if normalized.attachment_message and normalized.attachment_message is not update.message:
+        await process_message_attachment(
+            update,
+            context,
+            normalized.attachment_message,
+            normalized.combined_text,
+        )
+        return
+
+    vague_reference = user_text.casefold().strip(" ?!.,") in {
+        "видишь", "видно", "добавь это", "обработай это", "а так",
+    }
+    saved_context = context.user_data.get("last_structured_input")
+    if vague_reference and saved_context and not get_conversation(context):
+        await process_universal_payload(
+            update,
+            context,
+            InputPayload("forwarded_message", saved_context),
+            user_text,
+        )
+        return
+
+    structured = is_structured_telegram_text(normalized)
+    source_text = normalized.reply_text or normalized.main_text
+    if structured:
+        context.user_data["last_structured_input"] = normalized.combined_text
+    if structured and looks_like_schedule(source_text):
         message_key = f"forwarded:{update.effective_chat.id}:{update.message.message_id}"
         if not await asyncio.to_thread(
             input_dedup_store.claim,
             message_key,
-            user_text.encode("utf-8"),
+            normalized.combined_text.encode("utf-8"),
         ):
             await update.message.reply_text(
                 "Это расписание я уже недавно обработала. Используй готовый план выше."
             )
             return
         await update.message.reply_text("🔎 Читаю таблицу и ищу смены Марго...")
-        plan = await asyncio.to_thread(parse_markdown_shifts, user_text)
-        await present_universal_plan(update, context, plan, user_text, "Расписание Валеры")
+        plan = await asyncio.to_thread(parse_markdown_shifts, source_text)
+        await present_universal_plan(
+            update,
+            context,
+            plan,
+            source_text,
+            user_text if normalized.reply_text else "Расписание Валеры",
+        )
         return
-    await process_user_text(update, context, user_text)
+    if structured:
+        await process_universal_payload(
+            update,
+            context,
+            InputPayload("forwarded_message", normalized.combined_text),
+            user_text,
+        )
+        return
+    await process_user_text(update, context, normalized.combined_text or user_text)
 
 
 async def process_universal_payload(update, context, payload, user_request=""):
     await update.effective_message.reply_text("🔎 Читаю и составляю план...")
     extracted = await asyncio.to_thread(extract_content, payload)
+    logger.info(
+        "Planner input: source_type=%s request=%r extracted=%r",
+        payload.source_type,
+        str(user_request)[:2000],
+        str(extracted)[:6000],
+    )
     memories = await asyncio.to_thread(memory_store.as_prompt_context)
     plan = await asyncio.to_thread(
         build_plan,
@@ -1226,6 +1254,7 @@ async def process_user_text(update, context, user_text):
     # temporarily unavailable, the next message can continue the same thread.
     save_conversation(context, conversation)
     memories = await asyncio.to_thread(memory_store.as_prompt_context)
+    logger.info("Intent input: %r", user_text[:6000])
     intent = await asyncio.to_thread(
         detect_intent,
         user_text,
