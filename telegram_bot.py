@@ -57,7 +57,11 @@ from services.batch_service import (
     format_conflict,
 )
 from services.extraction_service import extract_content
-from services.input_service import InputPayload, detect_message_input
+from services.input_service import (
+    InputPayload,
+    detect_message_input,
+    get_message_attachment,
+)
 from services.input_dedup_service import InputDedupStore
 from services.markdown_schedule_service import (
     looks_like_schedule,
@@ -464,23 +468,31 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     message = update.effective_message
     source_type = detect_message_input(message)
+    attachment = get_message_attachment(message)
+    logger.info(
+        "Telegram attachment received: photo=%s document=%s animation=%s "
+        "video=%s sticker=%s detected=%s",
+        bool(getattr(message, "photo", None)),
+        bool(getattr(message, "document", None)),
+        bool(getattr(message, "animation", None)),
+        bool(getattr(message, "video", None)),
+        bool(getattr(message, "sticker", None)),
+        source_type,
+    )
+    if attachment is None:
+        await message.reply_text(
+            "Я получила вложение, но пока не могу прочитать этот формат. "
+            "Пришли его как фото или файл."
+        )
+        return
     if source_type == "document":
         await message.reply_text(
             "Пока я читаю изображения, PDF, CSV и XLSX. Этот формат не поддерживается."
         )
         return
-    if source_type == "image" and message.photo:
-        media = message.photo[-1]
-        telegram_file = await context.bot.get_file(media.file_id)
-        file_id = media.file_unique_id or media.file_id
-        filename = "image.jpg"
-        mime_type = "image/jpeg"
-    else:
-        document = message.document
-        telegram_file = await context.bot.get_file(document.file_id)
-        file_id = document.file_unique_id or document.file_id
-        filename = document.file_name or "document"
-        mime_type = document.mime_type or "application/octet-stream"
+    media, filename, mime_type = attachment
+    telegram_file = await context.bot.get_file(media.file_id)
+    file_id = media.file_unique_id or media.file_id
     content = bytes(await telegram_file.download_as_bytearray())
     if not await asyncio.to_thread(input_dedup_store.claim, file_id, content):
         await message.reply_text(
@@ -1346,13 +1358,13 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(
-        MessageHandler(filters.PHOTO | filters.Document.ALL, handle_attachment)
+        MessageHandler(filters.ATTACHMENT & ~filters.VOICE, handle_attachment)
     )
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_error_handler(handle_error)
 
     print("Бот запущен...")
