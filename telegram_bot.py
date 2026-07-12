@@ -52,6 +52,7 @@ from services.action_executor import (
 )
 from services.extraction_service import extract_content
 from services.input_service import InputPayload, detect_message_input
+from services.input_dedup_service import InputDedupStore
 from services.planner_service import build_plan
 
 
@@ -66,9 +67,11 @@ PERSISTENCE_PATH = DATA_DIR / "telegram_state.pickle"
 MEMORY_PATH = DATA_DIR / "memory.sqlite"
 ACTION_HISTORY_PATH = DATA_DIR / "actions.sqlite"
 REMINDER_PATH = DATA_DIR / "reminders.sqlite"
+INPUT_DEDUP_PATH = DATA_DIR / "processed_inputs.sqlite"
 memory_store = MemoryStore(MEMORY_PATH)
 action_history_store = ActionHistoryStore(ACTION_HISTORY_PATH)
 reminder_store = ReminderStore(REMINDER_PATH)
+input_dedup_store = InputDedupStore(INPUT_DEDUP_PATH)
 logger = logging.getLogger(__name__)
 LOCAL_TIMEZONE = ZoneInfo("Europe/Podgorica")
 
@@ -385,8 +388,13 @@ async def process_universal_payload(update, context, payload, user_request=""):
         f"\n\n⚠️ Возможных дубликатов: {len(skipped)}. Я пропущу их."
         if skipped else ""
     )
+    notes = [str(note).strip() for note in plan.get("notes", []) if str(note).strip()]
+    notes_text = "\n\n⚠️ " + "\n⚠️ ".join(notes) if notes else ""
     await update.effective_message.reply_text(
-        "Я подготовила план:\n\n" + format_plan(plan) + duplicate_text,
+        "Я подготовила план:\n\n"
+        + format_plan(plan)
+        + duplicate_text
+        + notes_text,
         reply_markup=plan_keyboard(),
     )
 
@@ -402,15 +410,24 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     if source_type == "image" and message.photo:
-        telegram_file = await context.bot.get_file(message.photo[-1].file_id)
+        media = message.photo[-1]
+        telegram_file = await context.bot.get_file(media.file_id)
+        file_id = media.file_unique_id or media.file_id
         filename = "image.jpg"
         mime_type = "image/jpeg"
     else:
         document = message.document
         telegram_file = await context.bot.get_file(document.file_id)
+        file_id = document.file_unique_id or document.file_id
         filename = document.file_name or "document"
         mime_type = document.mime_type or "application/octet-stream"
     content = bytes(await telegram_file.download_as_bytearray())
+    if not await asyncio.to_thread(input_dedup_store.claim, file_id, content):
+        await message.reply_text(
+            "Этот файл я уже недавно обработала. Используй готовый план выше "
+            "или нажми «✏️ Исправить»."
+        )
+        return
     payload = InputPayload(
         source_type=source_type,
         content=content,
