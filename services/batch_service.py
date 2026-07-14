@@ -139,6 +139,21 @@ def format_execution_report(summary, statuses=None):
 
 def batch_followup_response(user_text, summary):
     normalized = user_text.casefold()
+    # A saved batch report must not hijack a new calendar command merely
+    # because it contains words such as "отмена" or "заменить".  Treat the
+    # message as a report follow-up only when the user is explicitly asking
+    # to see or count a category from the previous result.
+    report_markers = (
+        "что ", "какие", "какое", "покажи", "покажи мне", "список",
+        "сколько", "итог", "результат", "что было", "что именно",
+    )
+    category_only = normalized.strip(" ?!.,:") in {
+        "пропущено", "пропущенные", "заменено", "замененные",
+        "создано", "созданные", "добавлено", "добавленные",
+        "отменено", "отмененные",
+    }
+    if not category_only and not any(marker in normalized for marker in report_markers):
+        return None
     status = None
     if "пропущ" in normalized:
         status = "skipped"
