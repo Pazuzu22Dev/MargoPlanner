@@ -189,6 +189,17 @@ def reminder_followup_keyboard(reminder_id):
     ]])
 
 
+def reminder_repeat_keyboard(reminder_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "✅ Да", callback_data=f"followup:snooze:{reminder_id}"
+        ),
+        InlineKeyboardButton(
+            "❌ Нет", callback_data=f"followup:close:{reminder_id}"
+        ),
+    ]])
+
+
 def format_daily_digest(events, reminders, local_now):
     weekdays = (
         "понедельник", "вторник", "среда", "четверг",
@@ -1065,15 +1076,43 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split(":")
         if (
             len(parts) != 3
-            or parts[1] not in {"done", "forgot"}
+            or parts[1] not in {"done", "forgot", "snooze", "close"}
             or not parts[2].isdigit()
         ):
             await query.message.reply_text("Этот ответ уже неактуален.")
             return
+        reminder_id = int(parts[2])
+        if parts[1] == "snooze":
+            remind_at = datetime.now(LOCAL_TIMEZONE) + timedelta(hours=1)
+            repeated = await asyncio.to_thread(
+                reminder_store.repeat_forgotten,
+                update.effective_user.id,
+                reminder_id,
+                remind_at.isoformat(),
+            )
+            if repeated:
+                await query.message.reply_text(
+                    "Хорошо, напомню ещё через час 🔔\n\n"
+                    f"{repeated['text']}"
+                )
+            else:
+                await query.message.reply_text("Этот выбор уже неактуален.")
+            return
+        if parts[1] == "close":
+            dismissed = await asyncio.to_thread(
+                reminder_store.dismiss_forgotten,
+                update.effective_user.id,
+                reminder_id,
+            )
+            await query.message.reply_text(
+                "Хорошо, больше не напоминаю."
+                if dismissed else "Этот выбор уже неактуален."
+            )
+            return
         saved = await asyncio.to_thread(
             reminder_store.answer_followup,
             update.effective_user.id,
-            int(parts[2]),
+            reminder_id,
             parts[1],
         )
         if not saved:
@@ -1082,7 +1121,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Отлично, отметила как выполненное ✅")
         else:
             await query.message.reply_text(
-                "Поняла 🙈 Если нужно, просто напиши: «напомни ещё раз…»"
+                "Поняла 🙈 Тогда напомнить тебе ещё через час?",
+                reply_markup=reminder_repeat_keyboard(reminder_id),
             )
         return
 
