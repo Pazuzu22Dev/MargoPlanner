@@ -152,6 +152,29 @@ def format_reminder_list(reminders):
     return "\n".join(lines)
 
 
+def format_memories(memories):
+    category_labels = {
+        "person": "👤 Люди",
+        "place": "📍 Места",
+        "project": "🎨 Проекты",
+        "preference": "💡 Предпочтения и привычки",
+    }
+    sections = []
+    for category, label in category_labels.items():
+        items = [item for item in memories if item["category"] == category]
+        if items:
+            sections.append(
+                label + ":\n" + "\n".join(
+                    f"• {item['value']}" for item in items
+                )
+            )
+    return "\n\n".join(sections)
+
+
+def format_memory_updates(updates):
+    return "\n".join(f"• {item['value'] or item['key']}" for item in updates)
+
+
 def confirmation_keyboard():
     return InlineKeyboardMarkup(
         [[
@@ -1347,6 +1370,16 @@ async def process_user_text(update, context, user_text):
             events = draft.get("events", [])
 
             if normalized_text in YES_ANSWERS:
+                if operation == "forget_memories":
+                    forgotten = await asyncio.to_thread(
+                        memory_store.apply_updates,
+                        draft["memory_updates"],
+                    )
+                    clear_conversation(context)
+                    await update.message.reply_text(
+                        "Готово, забыла:\n\n" + format_memory_updates(forgotten)
+                    )
+                    return
                 if operation == "universal_plan":
                     if draft.get("batch_analysis"):
                         summary = await asyncio.to_thread(
@@ -1580,10 +1613,14 @@ async def process_user_text(update, context, user_text):
 
             if normalized_text in NO_ANSWERS:
                 clear_conversation(context)
-
-                await update.message.reply_text(
-                    "Отменила. Календарь остался невредим."
-                )
+                if operation == "forget_memories":
+                    await update.message.reply_text(
+                        "Хорошо, ничего не забываю. Память осталась как была."
+                    )
+                else:
+                    await update.message.reply_text(
+                        "Отменила. Календарь остался невредим."
+                    )
                 return
 
         conversation = add_user_message(conversation, user_text)
@@ -1601,12 +1638,15 @@ async def process_user_text(update, context, user_text):
         conversation,
         memories,
     )
-    await asyncio.to_thread(
-        memory_store.apply_updates,
-        intent.get("memory_updates", []),
-    )
-
     action = intent.get("action")
+
+    if action != "forget_memory":
+        applied_memory_updates = await asyncio.to_thread(
+            memory_store.apply_updates,
+            intent.get("memory_updates", []),
+        )
+    else:
+        applied_memory_updates = []
 
     # Choosing from real calendar data is more useful than an abstract
     # clarification for requests such as "отмени событие".  Keep Gemini for
@@ -1626,6 +1666,47 @@ async def process_user_text(update, context, user_text):
                 "clarification_question",
                 "Уточните, пожалуйста, недостающие детали.",
             )
+        )
+        return
+
+    if action == "list_memories":
+        saved_memories = await asyncio.to_thread(memory_store.get_all)
+        clear_conversation(context)
+        if saved_memories:
+            await update.message.reply_text(
+                "Вот что я запомнила из наших разговоров:\n\n"
+                + format_memories(saved_memories)
+                + "\n\nМожешь попросить исправить или забыть любой факт."
+            )
+        else:
+            await update.message.reply_text(
+                "Пока в моей пополняемой памяти нет отдельных фактов. "
+                "Но базовый профиль о тебе у меня есть. Можешь написать: "
+                "«Запомни, что…»"
+            )
+        return
+
+    if action == "remember_memory":
+        clear_conversation(context)
+        await update.message.reply_text(
+            "Запомнила 🧠\n\n" + format_memory_updates(applied_memory_updates)
+        )
+        return
+
+    if action == "forget_memory":
+        updates = intent.get("memory_updates", [])
+        conversation["state"] = ConversationState.WAITING_FOR_CONFIRMATION
+        conversation["draft"] = {
+            "operation": "forget_memories",
+            "events": [],
+            "memory_updates": updates,
+        }
+        save_conversation(context, conversation)
+        await update.message.reply_text(
+            "Забыть из долговременной памяти:\n\n"
+            + format_memory_updates(updates)
+            + "\n\nПодтвердить?",
+            reply_markup=confirmation_keyboard(),
         )
         return
 
