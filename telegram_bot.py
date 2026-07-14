@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -166,6 +166,11 @@ def selection_keyboard(items, kind, destructive=True):
     rows = []
     for index, item in enumerate(items):
         title = item.get("title") or item.get("text") or "Без названия"
+        if kind == "event" and item.get("start_time"):
+            starts_at = datetime.fromisoformat(item["start_time"]).astimezone(
+                LOCAL_TIMEZONE
+            )
+            title = f"{starts_at.strftime('%d.%m %H:%M')} · {title}"
         rows.append([
             InlineKeyboardButton(
                 f"{icon} {title[:48]}",
@@ -174,6 +179,79 @@ def selection_keyboard(items, kind, destructive=True):
         ])
     rows.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(rows)
+
+
+def _relative_calendar_range(user_text):
+    """Return a local day range explicitly referenced by the user."""
+    normalized = user_text.casefold().replace("ё", "е")
+    offset = None
+    if "послезавтра" in normalized:
+        offset = 2
+    elif "завтра" in normalized:
+        offset = 1
+    elif "сегодня" in normalized:
+        offset = 0
+    if offset is None:
+        return None
+    start = datetime.now(LOCAL_TIMEZONE).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) + timedelta(days=offset)
+    return start.isoformat(), (start + timedelta(days=1)).isoformat()
+
+
+def search_calendar_candidates(search, user_text):
+    """Search narrowly first, then fall back to all events on the named day."""
+    effective = dict(search or {})
+    relative_range = _relative_calendar_range(user_text)
+    if relative_range:
+        # The user's explicit relative date is more trustworthy than an
+        # omitted range from the model. Existing explicit bounds are kept.
+        if not effective.get("time_min"):
+            effective["time_min"] = relative_range[0]
+        if not effective.get("time_max"):
+            effective["time_max"] = relative_range[1]
+
+    candidates = search_events(effective)
+    if candidates or not effective.get("text"):
+        return candidates
+
+    # Google Calendar's q filter is lexical. Natural phrases such as
+    # "отмена по бару и Лизе" can fail to match a differently-worded title.
+    # If a day/range is known, show that day's events and let Margo choose.
+    if effective.get("time_min") and effective.get("time_max"):
+        broad_search = dict(effective)
+        broad_search["text"] = ""
+        return search_events(broad_search)
+    return candidates
+
+
+def _generic_calendar_delete_intent(user_text):
+    """Build a deterministic search for an underspecified delete request."""
+    normalized = user_text.casefold().replace("ё", "е")
+    asks_to_delete = any(stem in normalized for stem in ("удал", "отмен"))
+    mentions_event = any(
+        stem in normalized for stem in ("событ", "встреч", "запис")
+    )
+    if not asks_to_delete or not mentions_event or "напомин" in normalized:
+        return None
+    relative_range = _relative_calendar_range(user_text)
+    if relative_range:
+        time_min, time_max = relative_range
+    else:
+        start = datetime.now(LOCAL_TIMEZONE)
+        time_min = start.isoformat()
+        time_max = (start + timedelta(days=14)).isoformat()
+    return {
+        "action": "delete_event",
+        "clarification_question": "",
+        "reason": "Выбрать календарное событие для удаления",
+        "target_event_id": "",
+        "search": {"text": "", "time_min": time_min, "time_max": time_max},
+        "events": [],
+        "memory_updates": [],
+        "reminder": {},
+        "target_reminder_ids": [],
+    }
 
 
 def reminder_actions_keyboard():
@@ -1369,6 +1447,15 @@ async def process_user_text(update, context, user_text):
 
     action = intent.get("action")
 
+    # Choosing from real calendar data is more useful than an abstract
+    # clarification for requests such as "отмени событие".  Keep Gemini for
+    # understanding detailed requests, but make this common UX deterministic.
+    if action == "clarify":
+        delete_intent = _generic_calendar_delete_intent(user_text)
+        if delete_intent:
+            intent = delete_intent
+            action = intent["action"]
+
     if action == "clarify":
         conversation = apply_intent(conversation, intent)
         save_conversation(context, conversation)
@@ -1509,8 +1596,9 @@ async def process_user_text(update, context, user_text):
         conversation = apply_intent(conversation, intent)
         if target is None:
             candidates = await asyncio.to_thread(
-                search_events,
+                search_calendar_candidates,
                 intent.get("search", {}),
+                user_text,
             )
             if not candidates:
                 conversation["state"] = ConversationState.WAITING_FOR_CLARIFICATION
