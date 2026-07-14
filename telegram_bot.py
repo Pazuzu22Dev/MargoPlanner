@@ -181,6 +181,59 @@ def selection_keyboard(items, kind, destructive=True):
     return InlineKeyboardMarkup(rows)
 
 
+def multi_event_selection_keyboard(items, selected_indexes=None):
+    selected = set(selected_indexes or [])
+    rows = []
+    for index, item in enumerate(items):
+        starts_at = datetime.fromisoformat(item["start_time"]).astimezone(
+            LOCAL_TIMEZONE
+        )
+        mark = "✅" if index in selected else "⬜️"
+        label = f"{mark} {starts_at.strftime('%H:%M')} · {item['title']}"
+        rows.append([InlineKeyboardButton(
+            label[:60], callback_data=f"multiselect:event:{index}"
+        )])
+    rows.append([InlineKeyboardButton(
+        f"➡️ Готово ({len(selected)})", callback_data="multiselect:done"
+    )])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_group_update_events(candidates, selected_indexes, proposed_event):
+    """Move a related event chain while preserving durations and gaps."""
+    selected = [candidates[index] for index in selected_indexes]
+    if not selected:
+        return [], []
+
+    def is_travel(event):
+        title = event.get("title", "").casefold().replace("ё", "е")
+        return any(word in title for word in ("дорога", "путь", "проезд"))
+
+    # The time mentioned by Margo normally belongs to the main appointment,
+    # not to its travel blocks. Prefer the non-travel item as the anchor.
+    anchor = next((event for event in selected if not is_travel(event)), selected[0])
+    anchor_start = datetime.fromisoformat(anchor["start_time"])
+    destination_start = datetime.fromisoformat(proposed_event["start_time"])
+    delta = destination_start - anchor_start
+
+    updated = []
+    for source in selected:
+        start = datetime.fromisoformat(source["start_time"]) + delta
+        end = datetime.fromisoformat(source["end_time"]) + delta
+        updated.append({
+            "title": source["title"],
+            "start_time": start.isoformat(),
+            "end_time": end.isoformat(),
+            "description": source.get("description", ""),
+            "location": source.get("location", ""),
+            "links": source.get("links", []),
+            "contacts": source.get("contacts", []),
+            "attendees": source.get("attendees", []),
+        })
+    return selected, updated
+
+
 def _relative_calendar_range(user_text):
     """Return a local day range explicitly referenced by the user."""
     normalized = user_text.casefold().replace("ё", "е")
@@ -452,6 +505,11 @@ def format_undo_action(action):
             "Вернуть событие к прежнему состоянию:\n\n"
             + format_events([payload["before"]])
         )
+    if action_type == "update_events":
+        return (
+            "Вернуть связанные события к прежнему состоянию:\n\n"
+            + format_events([item["before"] for item in payload["updates"]])
+        )
     return "Восстановить удалённые события:\n\n" + format_events(
         payload["events"]
     )
@@ -466,6 +524,10 @@ def undo_calendar_action(action):
     if action_type == "update_event":
         update_event(payload["event_id"], payload["before"])
         return "Вернула событие к прежнему состоянию."
+    if action_type == "update_events":
+        for item in payload["updates"]:
+            update_event(item["event_id"], item["before"])
+        return f"Вернула связанных событий: {len(payload['updates'])}."
     create_events(
         payload["events"],
         f"undo{action['id']}{uuid4().hex}",
@@ -864,6 +926,62 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     conversation = get_conversation(context)
+    if data.startswith("multiselect:"):
+        if not conversation or conversation.get("draft", {}).get("operation") != "update_event":
+            await query.message.reply_text("Этот список уже неактуален.")
+            return
+        draft = conversation["draft"]
+        selected = set(draft.get("selected_candidate_indexes", []))
+        if data.startswith("multiselect:event:"):
+            raw_index = data.rsplit(":", 1)[1]
+            if not raw_index.isdigit() or int(raw_index) >= len(draft["candidates"]):
+                await query.message.reply_text("Этот вариант уже неактуален.")
+                return
+            index = int(raw_index)
+            if index in selected:
+                selected.remove(index)
+            else:
+                selected.add(index)
+            draft["selected_candidate_indexes"] = sorted(selected)
+            save_conversation(context, conversation)
+            await query.edit_message_reply_markup(
+                reply_markup=multi_event_selection_keyboard(
+                    draft["candidates"], selected
+                )
+            )
+            return
+        if data == "multiselect:done":
+            if not selected:
+                await query.message.reply_text(
+                    "Отметь хотя бы одно событие, затем нажми «Готово»."
+                )
+                return
+            proposed = (draft.get("events") or [None])[0]
+            if not proposed:
+                await query.message.reply_text("Не вижу новой даты переноса.")
+                return
+            targets, events = build_group_update_events(
+                draft["candidates"], sorted(selected), proposed
+            )
+            draft["operation"] = "update_events"
+            draft["targets"] = targets
+            draft["events"] = events
+            draft["conflicts"] = await asyncio.to_thread(
+                find_conflicts, events, None, {item["id"] for item in targets}
+            )
+            conversation["state"] = ConversationState.WAITING_FOR_CONFIRMATION
+            save_conversation(context, conversation)
+            warning = format_conflicts(draft["conflicts"])
+            await query.message.reply_text(
+                "Перенести связанные события:\n\n"
+                + format_events(targets)
+                + "\n\nНа:\n\n"
+                + format_events(events)
+                + ("\n\n" + warning if warning else "")
+                + "\n\nПодтвердить?",
+                reply_markup=confirmation_keyboard(),
+            )
+            return
     if data.startswith("batchall:"):
         if not conversation or conversation.get("draft", {}).get("operation") not in {
             "universal_batch_review",
@@ -1282,6 +1400,27 @@ async def process_user_text(update, context, user_text):
                     return
                 if operation == "create_events":
                     excluded_ids = batch_event_ids(draft["batch_id"], len(events))
+                elif operation == "update_events":
+                    excluded_ids = {event["id"] for event in draft["targets"]}
+                    current_targets = []
+                    changed_targets = False
+                    for saved_target in draft["targets"]:
+                        current_target = await asyncio.to_thread(
+                            get_event, saved_target["id"]
+                        )
+                        current_targets.append(current_target)
+                        changed_targets = changed_targets or _event_changed(
+                            saved_target, current_target
+                        )
+                    if changed_targets:
+                        draft["targets"] = current_targets
+                        save_conversation(context, conversation)
+                        await update.message.reply_text(
+                            "Одно из связанных событий изменилось. "
+                            "Проверь перенос и подтверди ещё раз.",
+                            reply_markup=confirmation_keyboard(),
+                        )
+                        return
                 elif operation == "delete_events":
                     excluded_ids = {event["id"] for event in draft["targets"]}
                     current_targets = []
@@ -1322,7 +1461,7 @@ async def process_user_text(update, context, user_text):
                         )
                         return
 
-                if operation in {"create_events", "update_event"}:
+                if operation in {"create_events", "update_event", "update_events"}:
                     current_conflicts = await asyncio.to_thread(
                         find_conflicts,
                         events,
@@ -1387,6 +1526,28 @@ async def process_user_text(update, context, user_text):
                             "before": draft["target"],
                             "after": events[0],
                         },
+                    )
+                elif operation == "update_events":
+                    changed = []
+                    for target, event in zip(draft["targets"], events):
+                        result = await asyncio.to_thread(
+                            update_event, target["id"], event
+                        )
+                        changed.append(result)
+                    result_text = (
+                        f"Готово. Перенесла связанных событий: {len(changed)}. 🗓"
+                    )
+                    await asyncio.to_thread(
+                        action_history_store.record,
+                        "update_events",
+                        {"updates": [
+                            {
+                                "event_id": target["id"],
+                                "before": target,
+                                "after": event,
+                            }
+                            for target, event in zip(draft["targets"], events)
+                        ]},
                     )
                 elif operation == "delete_event":
                     await asyncio.to_thread(
@@ -1613,16 +1774,26 @@ async def process_user_text(update, context, user_text):
                 conversation["state"] = ConversationState.WAITING_FOR_CLARIFICATION
                 conversation["draft"]["candidates"] = candidates
                 save_conversation(context, conversation)
-                await update.message.reply_text(
-                    "Нашла несколько вариантов:\n\n"
-                    + format_candidates(candidates)
-                    + "\n\nВыбери нужное событие:",
-                    reply_markup=selection_keyboard(
-                        candidates,
-                        "event",
-                        destructive=action != "update_event",
-                    ),
-                )
+                if action == "update_event":
+                    conversation["draft"]["selected_candidate_indexes"] = []
+                    save_conversation(context, conversation)
+                    await update.message.reply_text(
+                        "Нашла несколько вариантов:\n\n"
+                        + format_candidates(candidates)
+                        + "\n\nМожно отметить несколько связанных событий "
+                        "(например, дорогу туда, встречу и дорогу обратно), "
+                        "затем нажать «Готово»:",
+                        reply_markup=multi_event_selection_keyboard(candidates),
+                    )
+                else:
+                    await update.message.reply_text(
+                        "Нашла несколько вариантов:\n\n"
+                        + format_candidates(candidates)
+                        + "\n\nВыбери нужное событие:",
+                        reply_markup=selection_keyboard(
+                            candidates, "event", destructive=True
+                        ),
+                    )
                 return
             if action == "delete_events":
                 draft = conversation["draft"]
