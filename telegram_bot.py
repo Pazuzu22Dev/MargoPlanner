@@ -97,6 +97,9 @@ reminder_store = ReminderStore(REMINDER_PATH)
 input_dedup_store = InputDedupStore(INPUT_DEDUP_PATH)
 logger = logging.getLogger(__name__)
 LOCAL_TIMEZONE = ZoneInfo("Europe/Podgorica")
+MORNING_DIGEST_HOUR = int(os.getenv("MORNING_DIGEST_HOUR", "8"))
+if not 0 <= MORNING_DIGEST_HOUR <= 23:
+    raise RuntimeError("MORNING_DIGEST_HOUR должен быть от 0 до 23")
 
 if not BOT_TOKEN:
     raise RuntimeError("Не найден TELEGRAM_BOT_TOKEN в .env")
@@ -173,6 +176,62 @@ def format_memories(memories):
 
 def format_memory_updates(updates):
     return "\n".join(f"• {item['value'] or item['key']}" for item in updates)
+
+
+def reminder_followup_keyboard(reminder_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "✅ Сделала", callback_data=f"followup:done:{reminder_id}"
+        ),
+        InlineKeyboardButton(
+            "🙈 Забыла", callback_data=f"followup:forgot:{reminder_id}"
+        ),
+    ]])
+
+
+def format_daily_digest(events, reminders, local_now):
+    weekdays = (
+        "понедельник", "вторник", "среда", "четверг",
+        "пятница", "суббота", "воскресенье",
+    )
+    months = (
+        "января", "февраля", "марта", "апреля", "мая", "июня",
+        "июля", "августа", "сентября", "октября", "ноября", "декабря",
+    )
+    sections = [
+        "☀️ Доброе утро!",
+        f"План на {weekdays[local_now.weekday()]}, "
+        f"{local_now.day} {months[local_now.month - 1]}:",
+    ]
+    if events:
+        lines = []
+        for index, event in enumerate(events, start=1):
+            start = datetime.fromisoformat(event["start_time"]).astimezone(
+                LOCAL_TIMEZONE
+            )
+            end = datetime.fromisoformat(event["end_time"]).astimezone(
+                LOCAL_TIMEZONE
+            )
+            lines.append(
+                f"{index}. {start.strftime('%H:%M')}–{end.strftime('%H:%M')} "
+                f"— {event['title']}"
+            )
+        sections.append("📅 Календарь:\n" + "\n".join(lines))
+    else:
+        sections.append("📅 В календаре на сегодня ничего нет.")
+    if reminders:
+        lines = []
+        for index, reminder in enumerate(reminders, start=1):
+            remind_at = datetime.fromisoformat(reminder["remind_at"]).astimezone(
+                LOCAL_TIMEZONE
+            )
+            lines.append(
+                f"{index}. {remind_at.strftime('%H:%M')} — {reminder['text']}"
+            )
+        sections.append("🔔 Напоминания:\n" + "\n".join(lines))
+    else:
+        sections.append("🔔 Напоминаний на сегодня нет.")
+    return "\n\n".join(sections)
 
 
 def confirmation_keyboard():
@@ -386,7 +445,7 @@ def duplicate_keyboard():
 async def reminder_dispatcher(application):
     reminder_store.recover_interrupted()
     while True:
-        for reminder in reminder_store.claim_due():
+        for reminder in await asyncio.to_thread(reminder_store.claim_due):
             try:
                 await application.bot.send_message(
                     chat_id=reminder["user_id"],
@@ -396,8 +455,73 @@ async def reminder_dispatcher(application):
                 reminder_store.release(reminder["id"])
                 logger.exception("Не удалось отправить напоминание id=%s", reminder["id"])
             else:
-                reminder_store.mark_sent(reminder["id"])
+                await asyncio.to_thread(reminder_store.mark_sent, reminder["id"])
+        for reminder in await asyncio.to_thread(
+            reminder_store.claim_due_followups
+        ):
+            try:
+                await application.bot.send_message(
+                    chat_id=reminder["user_id"],
+                    text=(
+                        "Прошёл час после напоминания:\n\n"
+                        f"🔔 {reminder['text']}\n\nТы сделала или забыла?"
+                    ),
+                    reply_markup=reminder_followup_keyboard(reminder["id"]),
+                )
+            except Exception:
+                await asyncio.to_thread(
+                    reminder_store.release_followup, reminder["id"]
+                )
+                logger.exception(
+                    "Не удалось отправить follow-up напоминания id=%s",
+                    reminder["id"],
+                )
+            else:
+                await asyncio.to_thread(
+                    reminder_store.mark_followup_sent, reminder["id"]
+                )
+        try:
+            await send_morning_digest_if_due(application)
+        except Exception:
+            logger.exception("Не удалось отправить утреннюю сводку")
         await asyncio.sleep(20)
+
+
+async def send_morning_digest_if_due(application, local_now=None):
+    if ALLOWED_USER_ID is None:
+        return False
+    now = (local_now or datetime.now(LOCAL_TIMEZONE)).astimezone(LOCAL_TIMEZONE)
+    if now.hour != MORNING_DIGEST_HOUR:
+        return False
+    local_date = now.date().isoformat()
+    already_sent = await asyncio.to_thread(
+        reminder_store.was_digest_sent, ALLOWED_USER_ID, local_date
+    )
+    if already_sent:
+        return False
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+    events, reminders = await asyncio.gather(
+        asyncio.to_thread(search_events, {
+            "text": "",
+            "time_min": day_start.isoformat(),
+            "time_max": day_end.isoformat(),
+        }),
+        asyncio.to_thread(
+            reminder_store.list_scheduled,
+            ALLOWED_USER_ID,
+            day_start.isoformat(),
+            day_end.isoformat(),
+        ),
+    )
+    await application.bot.send_message(
+        chat_id=ALLOWED_USER_ID,
+        text=format_daily_digest(events, reminders, now),
+    )
+    await asyncio.to_thread(
+        reminder_store.mark_digest_sent, ALLOWED_USER_ID, local_date
+    )
+    return True
 
 
 async def start_background_tasks(application):
@@ -936,6 +1060,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         effective_message=query.message,
         effective_user=update.effective_user,
     )
+
+    if data.startswith("followup:"):
+        parts = data.split(":")
+        if (
+            len(parts) != 3
+            or parts[1] not in {"done", "forgot"}
+            or not parts[2].isdigit()
+        ):
+            await query.message.reply_text("Этот ответ уже неактуален.")
+            return
+        saved = await asyncio.to_thread(
+            reminder_store.answer_followup,
+            update.effective_user.id,
+            int(parts[2]),
+            parts[1],
+        )
+        if not saved:
+            await query.message.reply_text("На это напоминание уже ответили.")
+        elif parts[1] == "done":
+            await query.message.reply_text("Отлично, отметила как выполненное ✅")
+        else:
+            await query.message.reply_text(
+                "Поняла 🙈 Если нужно, просто напиши: «напомни ещё раз…»"
+            )
+        return
 
     if data == "confirm:yes":
         await process_user_text(proxy, context, "да")
