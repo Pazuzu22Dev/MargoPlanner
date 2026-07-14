@@ -265,6 +265,46 @@ class ReminderStore:
             )
             return cursor.rowcount == 1
 
+    def repeat_forgotten(self, user_id, reminder_id, remind_at):
+        parsed = datetime.fromisoformat(remind_at)
+        if parsed.tzinfo is None:
+            raise ValueError("Новое время должно содержать часовой пояс")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT text FROM reminders WHERE id = ? AND user_id = ? "
+                "AND followup_status = 'forgot'",
+                (int(reminder_id), int(user_id)),
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = connection.execute(
+                "INSERT INTO reminders ("
+                "user_id, text, remind_at, created_at, followup_status"
+                ") VALUES (?, ?, ?, ?, 'pending')",
+                (
+                    int(user_id),
+                    row[0],
+                    parsed.astimezone(timezone.utc).isoformat(),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            connection.execute(
+                "UPDATE reminders SET followup_status = 'rescheduled' "
+                "WHERE id = ?",
+                (int(reminder_id),),
+            )
+            return {"id": cursor.lastrowid, "text": row[0]}
+
+    def dismiss_forgotten(self, user_id, reminder_id):
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE reminders SET followup_status = 'dismissed' "
+                "WHERE id = ? AND user_id = ? AND followup_status = 'forgot'",
+                (int(reminder_id), int(user_id)),
+            )
+            return cursor.rowcount == 1
+
     def was_digest_sent(self, user_id, local_date):
         with self._connect() as connection:
             row = connection.execute(
