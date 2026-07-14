@@ -37,6 +37,9 @@ ALLOWED_ACTIONS = {
     "list_reminders",
     "delete_reminder",
     "delete_reminders",
+    "list_memories",
+    "remember_memory",
+    "forget_memory",
 }
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -98,6 +101,14 @@ def validate_intent(raw_intent):
         raise ValueError("Для уточнения нужен вопрос")
     if action == "chat":
         result["events"] = []
+    if action == "remember_memory" and not any(
+        item["operation"] == "set" for item in result["memory_updates"]
+    ):
+        raise ValueError("Для запоминания нужен новый факт")
+    if action == "forget_memory" and not any(
+        item["operation"] == "delete" for item in result["memory_updates"]
+    ):
+        raise ValueError("Для удаления нужен существующий факт памяти")
     if action in {"delete_event", "delete_events"}:
         result["events"] = []
     if action == "create_events" and not result["events"]:
@@ -191,7 +202,7 @@ def detect_intent(user_text: str, conversation=None, memories="") -> dict:
 
 Верни строго JSON с полной актуальной версией плана:
 {{
-  "action": "chat | clarify | create_events | update_event | delete_event | delete_events | create_reminder | list_reminders | delete_reminder | delete_reminders",
+  "action": "chat | clarify | create_events | update_event | delete_event | delete_events | create_reminder | list_reminders | delete_reminder | delete_reminders | list_memories | remember_memory | forget_memory",
   "clarification_question": "один естественный вопрос или пустая строка",
   "reason": "кратко, что понято",
   "target_event_id": "ID только из draft.candidates или пустая строка",
@@ -286,6 +297,16 @@ def detect_intent(user_text: str, conversation=None, memories="") -> dict:
     общим уточняющим вопросом. Верни delete_event и диапазон ближайших 14 дней
     (от текущего времени), оставив search.text пустым: Python покажет список
     ближайших событий кнопками, чтобы Марго выбрала нужное.
+21. Если Марго явно говорит «запомни», используй remember_memory и верни один
+    или несколько memory_updates с operation=set. Сохраняй сам факт, а не слова
+    «Марго попросила запомнить».
+22. На вопросы «что ты обо мне помнишь», «покажи память» используй
+    list_memories. Ничего не добавляй и не удаляй.
+23. Если Марго просит «забудь», используй forget_memory. Найди соответствующие
+    реальные записи в переданной долговременной памяти и верни memory_updates
+    с operation=delete, точно сохранив их category и key. Не выдумывай ключи.
+    Если подходящей записи нет — используй clarify и прямо скажи, что факт не
+    найден. Удаление выполнит Python только после подтверждения пользователя.
 """
 
     for attempt in range(3):
