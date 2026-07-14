@@ -44,6 +44,13 @@ class ReminderStore:
                 connection.execute(
                     "ALTER TABLE reminders ADD COLUMN completed_at TEXT"
                 )
+            # Reminders scheduled before the migration are still future work
+            # and should participate in follow-ups. Already sent legacy rows
+            # keep the safe 'skipped' value and do not create a backlog.
+            connection.execute(
+                "UPDATE reminders SET followup_status = 'pending' "
+                "WHERE status = 'pending' AND followup_status = 'skipped'"
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS daily_digests (
