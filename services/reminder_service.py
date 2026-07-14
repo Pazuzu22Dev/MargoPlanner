@@ -17,7 +17,40 @@ class ReminderStore:
                     remind_at TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending',
                     created_at TEXT NOT NULL,
-                    sent_at TEXT
+                    sent_at TEXT,
+                    followup_status TEXT NOT NULL DEFAULT 'pending',
+                    followup_sent_at TEXT,
+                    completed_at TEXT
+                )
+                """
+            )
+            columns = {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(reminders)"
+                )
+            }
+            if "followup_status" not in columns:
+                # Old reminders must not suddenly produce a backlog of
+                # follow-up questions after this migration.
+                connection.execute(
+                    "ALTER TABLE reminders ADD COLUMN followup_status "
+                    "TEXT NOT NULL DEFAULT 'skipped'"
+                )
+            if "followup_sent_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE reminders ADD COLUMN followup_sent_at TEXT"
+                )
+            if "completed_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE reminders ADD COLUMN completed_at TEXT"
+                )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS daily_digests (
+                    user_id INTEGER NOT NULL,
+                    local_date TEXT NOT NULL,
+                    sent_at TEXT NOT NULL,
+                    PRIMARY KEY (user_id, local_date)
                 )
                 """
             )
@@ -33,8 +66,9 @@ class ReminderStore:
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as connection:
             cursor = connection.execute(
-                "INSERT INTO reminders (user_id, text, remind_at, created_at) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT INTO reminders ("
+                "user_id, text, remind_at, created_at, followup_status"
+                ") VALUES (?, ?, ?, ?, 'pending')",
                 (user_id, text.strip(), remind_at_utc, now),
             )
             return cursor.lastrowid
@@ -76,6 +110,30 @@ class ReminderStore:
             ).fetchall()
         return [
             {"id": row[0], "user_id": row[1], "text": row[2], "remind_at": row[3]}
+            for row in rows
+        ]
+
+    def list_scheduled(self, user_id, time_min, time_max):
+        start = datetime.fromisoformat(time_min)
+        end = datetime.fromisoformat(time_max)
+        if start.tzinfo is None or end.tzinfo is None or end <= start:
+            raise ValueError("Некорректный диапазон напоминаний")
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, user_id, text, remind_at, status FROM reminders "
+                "WHERE user_id = ? AND remind_at >= ? AND remind_at < ? "
+                "ORDER BY remind_at",
+                (
+                    user_id,
+                    start.astimezone(timezone.utc).isoformat(),
+                    end.astimezone(timezone.utc).isoformat(),
+                ),
+            ).fetchall()
+        return [
+            {
+                "id": row[0], "user_id": row[1], "text": row[2],
+                "remind_at": row[3], "status": row[4],
+            }
             for row in rows
         ]
 
@@ -144,6 +202,81 @@ class ReminderStore:
                 (datetime.now(timezone.utc).isoformat(), reminder_id),
             )
 
+    def claim_due_followups(self, now=None, delay_seconds=3600):
+        current = now or datetime.now(timezone.utc)
+        threshold = datetime.fromtimestamp(
+            current.timestamp() - delay_seconds, tz=timezone.utc
+        ).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT id, user_id, text, remind_at FROM reminders "
+                "WHERE status = 'sent' AND followup_status = 'pending' "
+                "AND sent_at <= ? ORDER BY sent_at",
+                (threshold,),
+            ).fetchall()
+            if rows:
+                connection.executemany(
+                    "UPDATE reminders SET followup_status = 'asking' "
+                    "WHERE id = ?",
+                    [(row[0],) for row in rows],
+                )
+        return [
+            {"id": row[0], "user_id": row[1], "text": row[2], "remind_at": row[3]}
+            for row in rows
+        ]
+
+    def mark_followup_sent(self, reminder_id):
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE reminders SET followup_status = 'asked', "
+                "followup_sent_at = ? WHERE id = ? AND followup_status = 'asking'",
+                (datetime.now(timezone.utc).isoformat(), int(reminder_id)),
+            )
+
+    def release_followup(self, reminder_id):
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE reminders SET followup_status = 'pending' "
+                "WHERE id = ? AND followup_status = 'asking'",
+                (int(reminder_id),),
+            )
+
+    def answer_followup(self, user_id, reminder_id, answer):
+        if answer not in {"done", "forgot"}:
+            raise ValueError("Неизвестный ответ на напоминание")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE reminders SET followup_status = ?, completed_at = ? "
+                "WHERE id = ? AND user_id = ? AND followup_status = 'asked'",
+                (
+                    answer,
+                    datetime.now(timezone.utc).isoformat(),
+                    int(reminder_id),
+                    int(user_id),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def was_digest_sent(self, user_id, local_date):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM daily_digests WHERE user_id = ? AND local_date = ?",
+                (int(user_id), str(local_date)),
+            ).fetchone()
+        return row is not None
+
+    def mark_digest_sent(self, user_id, local_date):
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO daily_digests (user_id, local_date, sent_at) "
+                "VALUES (?, ?, ?)",
+                (
+                    int(user_id), str(local_date),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
     def release(self, reminder_id):
         with self._connect() as connection:
             connection.execute(
@@ -156,4 +289,8 @@ class ReminderStore:
         with self._connect() as connection:
             connection.execute(
                 "UPDATE reminders SET status = 'pending' WHERE status = 'sending'"
+            )
+            connection.execute(
+                "UPDATE reminders SET followup_status = 'pending' "
+                "WHERE followup_status = 'asking'"
             )
