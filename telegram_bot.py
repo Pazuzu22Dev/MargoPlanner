@@ -461,6 +461,62 @@ def is_multi_action_request(user_text):
     )
 
 
+def parse_calendar_list_request(user_text, local_now=None):
+    """Build a real calendar query for natural requests such as Monday plans."""
+    normalized = " ".join(str(user_text).casefold().replace("ё", "е").split())
+    if any(word in normalized for word in (
+        "добавь", "добавить", "создай", "создать", "перенеси", "перенести",
+        "удали", "удалить", "отмени", "отменить", "напомни", "напомнить",
+    )):
+        return None
+    asks_to_look = any(marker in normalized for marker in (
+        "что у меня", "что стоит", "что запланировано", "какие событ",
+        "какие встреч", "какие созвон", "покажи календар", "проверь календар",
+        "загляни в календар", "расписание на", "планы на",
+    ))
+    if not asks_to_look:
+        return None
+
+    now = (local_now or datetime.now(LOCAL_TIMEZONE)).astimezone(LOCAL_TIMEZONE)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    relative_days = {"сегодня": 0, "завтра": 1, "послезавтра": 2}
+    offset = next(
+        (value for word, value in relative_days.items() if word in normalized),
+        None,
+    )
+    if offset is None:
+        weekdays = {
+            "понедельник": 0,
+            "вторник": 1,
+            "сред": 2,
+            "четверг": 3,
+            "пятниц": 4,
+            "суббот": 5,
+            "воскресень": 6,
+        }
+        target_weekday = next(
+            (number for stem, number in weekdays.items() if stem in normalized),
+            None,
+        )
+        if target_weekday is None:
+            return None
+        offset = (target_weekday - day_start.weekday()) % 7
+    day_start += timedelta(days=offset)
+    day_end = day_start + timedelta(days=1)
+    return {
+        "action": "show_calendar",
+        "clarification_question": "",
+        "reason": "Показать реальные события из Google Calendar",
+        "events": [],
+        "memory_updates": [],
+        "search": {
+            "text": "",
+            "time_min": day_start.isoformat(),
+            "time_max": day_end.isoformat(),
+        },
+    }
+
+
 def reminder_actions_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Добавить", callback_data="reminders:add")],
@@ -1902,13 +1958,17 @@ async def process_user_text(update, context, user_text):
             user_text,
         )
         return
-    logger.info("Intent input: %r", user_text[:6000])
-    intent = await asyncio.to_thread(
-        detect_intent,
-        user_text,
-        conversation,
-        memories,
-    )
+    calendar_list_intent = parse_calendar_list_request(user_text)
+    if calendar_list_intent:
+        intent = calendar_list_intent
+    else:
+        logger.info("Intent input: %r", user_text[:6000])
+        intent = await asyncio.to_thread(
+            detect_intent,
+            user_text,
+            conversation,
+            memories,
+        )
     explicit_reminder = parse_explicit_reminder_request(user_text)
     if explicit_reminder:
         intent = {
@@ -1964,6 +2024,24 @@ async def process_user_text(update, context, user_text):
                 "Пока в моей пополняемой памяти нет отдельных фактов. "
                 "Но базовый профиль о тебе у меня есть. Можешь написать: "
                 "«Запомни, что…»"
+            )
+        return
+
+    if action == "show_calendar":
+        search = intent["search"]
+        events = await asyncio.to_thread(search_events, search)
+        clear_conversation(context)
+        day = datetime.fromisoformat(search["time_min"]).astimezone(
+            LOCAL_TIMEZONE
+        )
+        if events:
+            await update.message.reply_text(
+                f"Вот что стоит в календаре на {day.strftime('%d.%m.%Y')}:\n\n"
+                + format_events(events)
+            )
+        else:
+            await update.message.reply_text(
+                f"На {day.strftime('%d.%m.%Y')} в календаре ничего нет. ✨"
             )
         return
 
