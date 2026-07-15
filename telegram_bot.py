@@ -2215,6 +2215,22 @@ async def process_user_text(update, context, user_text):
 
 async def handle_error(update, context):
     logger.exception("Ошибка при обработке Telegram update", exc_info=context.error)
+    message = getattr(update, "effective_message", None)
+    user = getattr(update, "effective_user", None)
+    if (
+        message
+        and ALLOWED_USER_ID is not None
+        and user
+        and user.id == ALLOWED_USER_ID
+    ):
+        try:
+            await message.reply_text(
+                "Я не смогла обработать этот запрос до конца. Ничего не "
+                "выполнила и сохранила контекст — попробуй повторить или "
+                "уточнить формулировку."
+            )
+        except Exception:
+            logger.exception("Не удалось сообщить пользователю об ошибке")
 
 
 async def handle_unrecognized_message(
