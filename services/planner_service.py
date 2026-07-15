@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -16,6 +17,81 @@ STANDARD_ACTIONS = {
     "delete_reminder",
 }
 TIMEZONE = ZoneInfo("Europe/Podgorica")
+
+
+def normalize_linked_reminders(raw, user_request=""):
+    """Normalize common Gemini aliases and repair reminders linked to events."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("actions"), list):
+        return raw
+    latest_event = None
+    request = str(user_request)
+    reminder_match = re.search(r"\bнапомин\w*", request, re.IGNORECASE)
+    reminder_clause = request[reminder_match.start():] if reminder_match else request
+
+    for item in raw["actions"]:
+        if not isinstance(item, dict):
+            continue
+        action = item.get("action")
+        data = item.get("data")
+        data = dict(data) if isinstance(data, dict) else {}
+        if action in {"create_calendar_event", "update_calendar_event"}:
+            latest_event = data
+            item["data"] = data
+            continue
+        if action not in {"create_reminder", "update_reminder"}:
+            continue
+
+        nested = data.get("reminder")
+        if not isinstance(nested, dict):
+            nested = item.get("reminder")
+        if not isinstance(nested, dict):
+            nested = {}
+        reminder_text = (
+            data.get("text") or data.get("title")
+            or nested.get("text") or nested.get("title")
+        )
+        reminder_time = (
+            data.get("remind_at") or nested.get("remind_at")
+            or data.get("datetime") or nested.get("datetime")
+        )
+
+        event_start = None
+        if latest_event and latest_event.get("start_time"):
+            event_start = datetime.fromisoformat(latest_event["start_time"])
+        if not reminder_text and latest_event:
+            title = str(latest_event.get("title", "Событие")).strip()
+            reminder_text = (
+                f"{title} в {event_start:%H:%M}" if event_start else title
+            )
+        if not reminder_time and event_start:
+            time_match = re.search(
+                r"\bв\s+(\d{1,2})(?:[:.](\d{2}))?\s*"
+                r"(утра|дня|вечера|ночи)?\b",
+                reminder_clause,
+                re.IGNORECASE,
+            )
+            if time_match:
+                hour = int(time_match.group(1))
+                minute = int(time_match.group(2) or 0)
+                day_part = (time_match.group(3) or "").casefold()
+                if day_part in {"дня", "вечера"} and hour < 12:
+                    hour += 12
+                elif day_part in {"утра", "ночи"} and hour == 12:
+                    hour = 0
+                if 0 <= hour <= 23 and 0 <= minute <= 59:
+                    reminder_time = event_start.replace(
+                        hour=hour,
+                        minute=minute,
+                        second=0,
+                        microsecond=0,
+                    ).isoformat()
+        if reminder_text:
+            data["text"] = str(reminder_text).strip()
+        if reminder_time:
+            data["remind_at"] = str(reminder_time).strip()
+        data.pop("reminder", None)
+        item["data"] = data
+    return raw
 
 
 def validate_plan(raw):
@@ -123,7 +199,7 @@ def build_plan(extracted, user_request="", memories=""):
         contents=contents,
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
-    raw = json.loads(response.text)
+    raw = normalize_linked_reminders(json.loads(response.text), user_request)
     for item in raw.get("actions") or []:
         if item.get("action") in {"create_calendar_event", "update_calendar_event"}:
             data = item.get("data") or {}
@@ -145,4 +221,14 @@ def build_plan(extracted, user_request="", memories=""):
                     ),
                     "notes": raw.get("notes", []),
                 }
-    return validate_plan(raw)
+    try:
+        return validate_plan(raw)
+    except (TypeError, ValueError) as error:
+        return {
+            "actions": [],
+            "clarification_question": (
+                "Я увидела несколько действий, но в одном из них не хватает "
+                f"точных данных ({error}). Уточни, пожалуйста, этот пункт."
+            ),
+            "notes": [],
+        }
