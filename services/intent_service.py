@@ -33,6 +33,7 @@ ALLOWED_ACTIONS = {
     "update_event",
     "delete_event",
     "delete_events",
+    "show_calendar",
     "create_reminder",
     "list_reminders",
     "delete_reminder",
@@ -127,15 +128,15 @@ def validate_intent(raw_intent):
         result["events"] = []
     if action == "update_event" and len(result["events"]) != 1:
         raise ValueError("Для изменения нужен ровно один новый вариант события")
-    if action in {"update_event", "delete_event", "delete_events", "list_reminders", "delete_reminder", "delete_reminders"}:
+    if action in {"update_event", "delete_event", "delete_events", "show_calendar", "list_reminders", "delete_reminder", "delete_reminders"}:
         result["search"] = {
             "text": str(result["search"].get("text", "")).strip(),
             "time_min": str(result["search"].get("time_min", "")).strip(),
             "time_max": str(result["search"].get("time_max", "")).strip(),
         }
-        if action == "list_reminders":
+        if action in {"show_calendar", "list_reminders"}:
             if not result["search"]["time_min"] or not result["search"]["time_max"]:
-                raise ValueError("Для списка напоминаний нужен диапазон дат")
+                raise ValueError("Для просмотра нужен диапазон дат")
             _validate_iso_datetime(result["search"]["time_min"], "time_min")
             _validate_iso_datetime(result["search"]["time_max"], "time_max")
         elif action in {"delete_reminder", "delete_reminders"}:
@@ -202,7 +203,7 @@ def detect_intent(user_text: str, conversation=None, memories="") -> dict:
 
 Верни строго JSON с полной актуальной версией плана:
 {{
-  "action": "chat | clarify | create_events | update_event | delete_event | delete_events | create_reminder | list_reminders | delete_reminder | delete_reminders | list_memories | remember_memory | forget_memory",
+  "action": "chat | clarify | create_events | update_event | delete_event | delete_events | show_calendar | create_reminder | list_reminders | delete_reminder | delete_reminders | list_memories | remember_memory | forget_memory",
   "clarification_question": "один естественный вопрос или пустая строка",
   "reason": "кратко, что понято",
   "target_event_id": "ID только из draft.candidates или пустая строка",
@@ -276,6 +277,9 @@ def detect_intent(user_text: str, conversation=None, memories="") -> dict:
     create_reminder, а не Google Calendar. Заполни reminder.text и remind_at.
     Если точной даты или времени нет — clarify. Фразы «часов в 10» понимай как
     приблизительное 10:00, если это не создаёт противоречия.
+    В конструкции «напомни сегодня в 15, что в 16:20 встреча» первое время
+    (15:00) — remind_at, а второе (16:20) является частью reminder.text.
+    Никогда не подменяй время отправки временем события из текста напоминания.
 17. Если Марго спрашивает, какие напоминания у неё есть, используй
     list_reminders. В search.time_min и search.time_max верни границы нужного
     дня или периода с часовым поясом. Для «сегодня» это 00:00 сегодняшнего дня
@@ -307,6 +311,11 @@ def detect_intent(user_text: str, conversation=None, memories="") -> dict:
     с operation=delete, точно сохранив их category и key. Не выдумывай ключи.
     Если подходящей записи нет — используй clarify и прямо скажи, что факт не
     найден. Удаление выполнит Python только после подтверждения пользователя.
+24. Если Марго спрашивает, что стоит или запланировано в календаре на день или
+    период, просит «проверь календарь», «какие события/созвоны» или «что у меня
+    в понедельник», используй show_calendar. Заполни search.time_min и
+    search.time_max точными границами периода, search.text оставь пустым, если
+    она не назвала конкретное событие. Ничего не создавай и не проси подтверждение.
 """
 
     for attempt in range(3):
