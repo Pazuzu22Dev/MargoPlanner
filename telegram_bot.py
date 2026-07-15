@@ -440,6 +440,27 @@ def parse_explicit_reminder_request(user_text, local_now=None):
     return {"text": text, "remind_at": remind_at.isoformat()}
 
 
+def is_multi_action_request(user_text):
+    """Return True when one message asks Pinky to perform several actions."""
+    normalized = " ".join(str(user_text).casefold().replace("ё", "е").split())
+    if not re.search(r"\b(?:и|а еще|также|плюс)\b", normalized):
+        return False
+
+    action_verbs = re.findall(
+        r"\b(?:добавь|добавить|создай|создать|сделай|сделать|поставь|"
+        r"поставить|напомни|напомнить|перенеси|перенести|измени|изменить|"
+        r"удали|удалить|отмени|отменить)\b",
+        normalized,
+    )
+    has_calendar_object = bool(
+        re.search(r"\b(?:событи\w*|встреч\w*|календар\w*)\b", normalized)
+    )
+    has_reminder_object = bool(re.search(r"\bнапомин\w*\b", normalized))
+    return len(action_verbs) >= 2 or (
+        bool(action_verbs) and has_calendar_object and has_reminder_object
+    )
+
+
 def reminder_actions_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Добавить", callback_data="reminders:add")],
@@ -1862,6 +1883,25 @@ async def process_user_text(update, context, user_text):
     # temporarily unavailable, the next message can continue the same thread.
     save_conversation(context, conversation)
     memories = await asyncio.to_thread(memory_store.as_prompt_context)
+    if (
+        conversation.get("state") == ConversationState.IDLE
+        and is_multi_action_request(user_text)
+    ):
+        logger.info("Multi-action planner input: %r", user_text[:6000])
+        plan = await asyncio.to_thread(
+            build_plan,
+            user_text,
+            user_text,
+            memories,
+        )
+        await present_universal_plan(
+            update,
+            context,
+            plan,
+            user_text,
+            user_text,
+        )
+        return
     logger.info("Intent input: %r", user_text[:6000])
     intent = await asyncio.to_thread(
         detect_intent,
