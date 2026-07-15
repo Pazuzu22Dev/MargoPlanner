@@ -400,6 +400,46 @@ def _generic_calendar_delete_intent(user_text):
     }
 
 
+def parse_explicit_reminder_request(user_text, local_now=None):
+    """Separate delivery time from a later time mentioned in reminder text."""
+    match = re.search(
+        r"\bнапомни(?:\s+мне)?[\s,]*"
+        r"(?:(сегодня|завтра|послезавтра)\s+)?"
+        r"в\s+(\d{1,2})(?::(\d{2}))?"
+        r"(?:\s*час(?:а|ов)?)?\b(.*)",
+        user_text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    day_word, hour_text, minute_text, remainder = match.groups()
+    hour = int(hour_text)
+    minute = int(minute_text or 0)
+    if hour > 23 or minute > 59:
+        return None
+    now = (local_now or datetime.now(LOCAL_TIMEZONE)).astimezone(LOCAL_TIMEZONE)
+    day_offset = {"сегодня": 0, "завтра": 1, "послезавтра": 2}.get(
+        (day_word or "").casefold()
+    )
+    remind_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if day_offset is not None:
+        remind_at += timedelta(days=day_offset)
+    elif remind_at <= now:
+        remind_at += timedelta(days=1)
+
+    text = remainder.strip(" ,.—-:")
+    text = re.sub(
+        r"^(?:о\s+том\s*,?\s*что|что)\s+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    if not text:
+        return None
+    text = text[0].upper() + text[1:]
+    return {"text": text, "remind_at": remind_at.isoformat()}
+
+
 def reminder_actions_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Добавить", callback_data="reminders:add")],
@@ -1806,6 +1846,8 @@ async def process_user_text(update, context, user_text):
                     await update.message.reply_text(
                         "Хорошо, ничего не забываю. Память осталась как была."
                     )
+                elif operation == "create_reminder":
+                    await update.message.reply_text("Хорошо, напоминание не ставлю.")
                 else:
                     await update.message.reply_text(
                         "Отменила. Календарь остался невредим."
@@ -1827,6 +1869,16 @@ async def process_user_text(update, context, user_text):
         conversation,
         memories,
     )
+    explicit_reminder = parse_explicit_reminder_request(user_text)
+    if explicit_reminder:
+        intent = {
+            **intent,
+            "action": "create_reminder",
+            "clarification_question": "",
+            "reason": "Явно указаны время напоминания и его содержание",
+            "events": [],
+            "reminder": explicit_reminder,
+        }
     action = intent.get("action")
 
     if action != "forget_memory":
