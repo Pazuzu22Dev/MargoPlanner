@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,36 @@ SENSITIVE_MARKERS = {
     "secret",
     "секретный ключ",
 }
+
+
+def infer_stable_memories(user_text):
+    """Extract only durable profile facts from ordinary planning messages."""
+    normalized = " ".join(str(user_text).casefold().replace("ё", "е").split())
+    updates = []
+    if re.search(r"\bсмен\w*\b", normalized):
+        updates.append({
+            "operation": "set",
+            "category": "preference",
+            "key": "сменный рабочий график",
+            "value": (
+                "Марго работает по сменному графику. Конкретные даты и время "
+                "смен нужно брать из актуального сообщения или Google Calendar."
+            ),
+        })
+    if any(marker in normalized for marker in (
+        "я художник", "работаю художником", "ui artist", "ui/ux artist",
+        "ui designer", "дизайнер интерфейсов",
+    )):
+        updates.append({
+            "operation": "set",
+            "category": "preference",
+            "key": "профессия Марго",
+            "value": (
+                "Марго — Senior UI Artist / Lead UI Designer, художник и "
+                "дизайнер игровых интерфейсов."
+            ),
+        })
+    return updates
 
 
 def validate_memory_updates(raw_updates):
