@@ -21,6 +21,7 @@ from telegram.ext import (
 )
 
 from services.calendar_service import (
+    CalendarAuthorizationError,
     batch_event_ids,
     create_events,
     delete_event,
@@ -2426,11 +2427,19 @@ async def handle_error(update, context):
         and user.id == ALLOWED_USER_ID
     ):
         try:
-            await message.reply_text(
-                "Я не смогла обработать этот запрос до конца. Ничего не "
-                "выполнила и сохранила контекст — попробуй повторить или "
-                "уточнить формулировку."
-            )
+            if isinstance(context.error, CalendarAuthorizationError):
+                text = (
+                    "Google Calendar временно отключился: доступ истёк или "
+                    "был отозван. Нужно один раз переподключить календарь. "
+                    "Твои данные и текущий запрос сохранены."
+                )
+            else:
+                text = (
+                    "Я не смогла обработать этот запрос до конца. Ничего не "
+                    "выполнила и сохранила контекст — попробуй повторить или "
+                    "уточнить формулировку."
+                )
+            await message.reply_text(text)
         except Exception:
             logger.exception("Не удалось сообщить пользователю об ошибке")
 

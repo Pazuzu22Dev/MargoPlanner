@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -23,12 +24,18 @@ TIMEZONE_NAME = "Europe/Podgorica"
 TIMEZONE = ZoneInfo(TIMEZONE_NAME)
 
 
+class CalendarAuthorizationError(RuntimeError):
+    """Google Calendar credentials need to be connected again."""
+
+
 def _write_json_secret_from_base64(environment_name, destination):
     encoded = os.getenv(environment_name)
-    if destination.exists() or not encoded:
+    if not encoded:
         return
     decoded = base64.b64decode(encoded).decode("utf-8")
     json.loads(decoded)
+    if destination.exists() and destination.read_text(encoding="utf-8") == decoded:
+        return
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(decoded, encoding="utf-8")
 
@@ -51,12 +58,24 @@ def get_calendar_service():
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except RefreshError as error:
+                if os.getenv("RAILWAY_ENVIRONMENT"):
+                    raise CalendarAuthorizationError(
+                        "Google Calendar отключён: токен доступа истёк или "
+                        "был отозван. Нужно заново подключить календарь."
+                    ) from error
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    CREDENTIALS_PATH,
+                    SCOPES,
+                )
+                creds = flow.run_local_server(port=0)
         else:
             if os.getenv("RAILWAY_ENVIRONMENT"):
-                raise RuntimeError(
-                    "Google token нельзя авторизовать через браузер на сервере. "
-                    "Передайте актуальный GOOGLE_TOKEN_B64."
+                raise CalendarAuthorizationError(
+                    "Google Calendar отключён. Нужно заново подключить "
+                    "календарь и обновить GOOGLE_TOKEN_B64."
                 )
             flow = InstalledAppFlow.from_client_secrets_file(
                 CREDENTIALS_PATH,

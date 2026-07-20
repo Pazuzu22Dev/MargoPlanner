@@ -1,6 +1,13 @@
 import unittest
+import base64
+import json
+import os
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 from services.calendar_service import (
+    _write_json_secret_from_base64,
     _batch_event_id,
     batch_event_ids,
     create_events,
@@ -55,6 +62,26 @@ class FakeService:
 
 
 class CalendarServiceTests(unittest.TestCase):
+    def test_environment_secret_replaces_stale_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "token.json"
+            destination.write_text('{"token": "old"}', encoding="utf-8")
+            current = {"token": "new", "refresh_token": "refresh"}
+            encoded = base64.b64encode(
+                json.dumps(current).encode("utf-8")
+            ).decode("ascii")
+
+            with patch.dict(os.environ, {"TEST_GOOGLE_TOKEN_B64": encoded}):
+                _write_json_secret_from_base64(
+                    "TEST_GOOGLE_TOKEN_B64",
+                    destination,
+                )
+
+            self.assertEqual(
+                json.loads(destination.read_text(encoding="utf-8")),
+                current,
+            )
+
     def test_batch_ids_are_stable_and_unique(self):
         self.assertEqual(_batch_event_id("batch", 0), _batch_event_id("batch", 0))
         self.assertNotEqual(_batch_event_id("batch", 0), _batch_event_id("batch", 1))
