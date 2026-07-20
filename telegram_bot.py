@@ -42,7 +42,7 @@ from services.conversation_service import (
     save_conversation,
 )
 from services.intent_service import detect_intent
-from services.memory_service import MemoryStore
+from services.memory_service import MemoryStore, infer_stable_memories
 from services.voice_service import VoiceQuotaError, transcribe_voice
 from services.reminder_service import ReminderStore
 from services.action_executor import (
@@ -92,6 +92,26 @@ ACTION_HISTORY_PATH = DATA_DIR / "actions.sqlite"
 REMINDER_PATH = DATA_DIR / "reminders.sqlite"
 INPUT_DEDUP_PATH = DATA_DIR / "processed_inputs.sqlite"
 memory_store = MemoryStore(MEMORY_PATH)
+memory_store.apply_updates([
+    {
+        "operation": "set",
+        "category": "preference",
+        "key": "профессия Марго",
+        "value": (
+            "Марго — Senior UI Artist / Lead UI Designer, художник и "
+            "дизайнер игровых интерфейсов."
+        ),
+    },
+    {
+        "operation": "set",
+        "category": "preference",
+        "key": "сменный рабочий график",
+        "value": (
+            "Марго работает по сменному графику. Конкретные даты и время "
+            "смен нужно брать из актуального сообщения или Google Calendar."
+        ),
+    },
+])
 action_history_store = ActionHistoryStore(ACTION_HISTORY_PATH)
 reminder_store = ReminderStore(REMINDER_PATH)
 input_dedup_store = InputDedupStore(INPUT_DEDUP_PATH)
@@ -411,6 +431,15 @@ def parse_explicit_reminder_request(user_text, local_now=None):
         flags=re.IGNORECASE,
     )
     if not match:
+        match = re.search(
+            r"(?:(сегодня|завтра|послезавтра)\s+)?"
+            r"\bв\s+(\d{1,2})(?::(\d{2}))?"
+            r"(?:\s*час(?:а|ов)?)?[\s,]*"
+            r"напомни(?:\s+мне)?\b(.*)",
+            user_text,
+            flags=re.IGNORECASE,
+        )
+    if not match:
         return None
     day_word, hour_text, minute_text, remainder = match.groups()
     hour = int(hour_text)
@@ -438,6 +467,88 @@ def parse_explicit_reminder_request(user_text, local_now=None):
         return None
     text = text[0].upper() + text[1:]
     return {"text": text, "remind_at": remind_at.isoformat()}
+
+
+def parse_shift_schedule_request(user_text, local_now=None):
+    """Parse compact weekly shift messages without relying on Gemini."""
+    normalized = str(user_text).casefold().replace("ё", "е")
+    if "смен" not in normalized:
+        return None
+    weekday_patterns = {
+        0: r"\b(?:пн|понедельник)\b",
+        1: r"\b(?:вт|вторник)\b",
+        2: r"\b(?:ср|среда|среду)\b",
+        3: r"\b(?:чт|четверг)\b",
+        4: r"\b(?:пт|пятница|пятницу)\b",
+        5: r"\b(?:сб|суббота|субботу)\b",
+        6: r"\b(?:вс|воскресенье)\b",
+    }
+    if not any(re.search(pattern, normalized) for pattern in weekday_patterns.values()):
+        return None
+
+    slots = {}
+    for slot_number, slot_pattern in (
+        (1, r"(?:первая|1)\s*(?:смена)?"),
+        (2, r"(?:вторая|2)\s*(?:смена)?"),
+    ):
+        match = re.search(
+            slot_pattern
+            + r"\s*(\d{1,2})(?::(\d{2}))?\s*[-–]\s*"
+            r"(\d{1,2})(?::(\d{2}))?",
+            normalized,
+        )
+        if match:
+            slots[slot_number] = (
+                int(match.group(1)), int(match.group(2) or 0),
+                int(match.group(3)), int(match.group(4) or 0),
+            )
+    slots.setdefault(1, (8, 0, 15, 0))
+    slots.setdefault(2, (15, 0, 22, 0))
+
+    now = (local_now or datetime.now(LOCAL_TIMEZONE)).astimezone(LOCAL_TIMEZONE)
+    week_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start -= timedelta(days=week_start.weekday())
+    if "следующ" in normalized and "недел" in normalized:
+        week_start += timedelta(days=7)
+
+    events = []
+    for clause in re.split(r"[,.;\n]+", normalized):
+        weekdays = [
+            number for number, pattern in weekday_patterns.items()
+            if re.search(pattern, clause)
+        ]
+        if not weekdays or "выходн" in clause:
+            continue
+        slot_number = None
+        if re.search(r"\b(?:первая|1)\s*(?:смена)?\b", clause):
+            slot_number = 1
+        elif re.search(r"\b(?:вторая|2)\s*(?:смена)?\b", clause):
+            slot_number = 2
+        if slot_number is None:
+            continue
+        start_hour, start_minute, end_hour, end_minute = slots[slot_number]
+        if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23):
+            return None
+        for weekday in weekdays:
+            day = week_start + timedelta(days=weekday)
+            start = day.replace(hour=start_hour, minute=start_minute)
+            end = day.replace(hour=end_hour, minute=end_minute)
+            if end <= start:
+                end += timedelta(days=1)
+            events.append({
+                "title": "Рабочая смена",
+                "start_time": start.isoformat(),
+                "end_time": end.isoformat(),
+                "description": "",
+                "location": "",
+                "links": [],
+                "contacts": [],
+                "attendees": [],
+            })
+    unique = {
+        (event["start_time"], event["end_time"]): event for event in events
+    }
+    return list(unique.values()) or None
 
 
 def is_multi_action_request(user_text):
@@ -1938,8 +2049,30 @@ async def process_user_text(update, context, user_text):
     # Persist the latest user message before an external API call. If Gemini is
     # temporarily unavailable, the next message can continue the same thread.
     save_conversation(context, conversation)
+    inferred_memories = infer_stable_memories(user_text)
+    if inferred_memories:
+        await asyncio.to_thread(memory_store.apply_updates, inferred_memories)
     memories = await asyncio.to_thread(memory_store.as_prompt_context)
-    if (
+    explicit_reminder = parse_explicit_reminder_request(user_text)
+    shift_events = parse_shift_schedule_request(user_text)
+    if explicit_reminder:
+        intent = {
+            "action": "create_reminder",
+            "clarification_question": "",
+            "reason": "Явно указаны время и текст напоминания",
+            "events": [],
+            "memory_updates": [],
+            "reminder": explicit_reminder,
+        }
+    elif shift_events:
+        intent = {
+            "action": "create_events",
+            "clarification_question": "",
+            "reason": "Распознано недельное расписание смен",
+            "events": shift_events,
+            "memory_updates": inferred_memories,
+        }
+    elif (
         conversation.get("state") == ConversationState.IDLE
         and is_multi_action_request(user_text)
     ):
@@ -1958,27 +2091,18 @@ async def process_user_text(update, context, user_text):
             user_text,
         )
         return
-    calendar_list_intent = parse_calendar_list_request(user_text)
-    if calendar_list_intent:
-        intent = calendar_list_intent
     else:
-        logger.info("Intent input: %r", user_text[:6000])
-        intent = await asyncio.to_thread(
-            detect_intent,
-            user_text,
-            conversation,
-            memories,
-        )
-    explicit_reminder = parse_explicit_reminder_request(user_text)
-    if explicit_reminder:
-        intent = {
-            **intent,
-            "action": "create_reminder",
-            "clarification_question": "",
-            "reason": "Явно указаны время напоминания и его содержание",
-            "events": [],
-            "reminder": explicit_reminder,
-        }
+        calendar_list_intent = parse_calendar_list_request(user_text)
+        if calendar_list_intent:
+            intent = calendar_list_intent
+        else:
+            logger.info("Intent input: %r", user_text[:6000])
+            intent = await asyncio.to_thread(
+                detect_intent,
+                user_text,
+                conversation,
+                memories,
+            )
     action = intent.get("action")
 
     if action != "forget_memory":
